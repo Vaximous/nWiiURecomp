@@ -1622,16 +1622,22 @@ void test_startup_float_forms() {
                       std::bit_cast<double>(cpu.fpr[7][1]) == 1.0,
                   "psq_l W=1 loads one element and sets the second lane to 1.0");
     {
-        auto quantized = make_image({0xE0E71000}); // psq_l with I=1 (GQR1)
+        // mtspr UGQR7,r8 then psq_l f7,0(r7),0,GQR7: S16 with LD_SCALE 2
+        // dequantizes by 2^-2.
+        auto quantized = make_image({0x7D07E3A6, 0xE0E77000});
+        quantized.memory.write16(kData, static_cast<uint16_t>(-8), 0);
+        quantized.memory.write16(kData + 2, 6, 0);
         CPUContext quantized_cpu;
         quantized_cpu.pc = kCode;
         quantized_cpu.gpr[7] = kData;
-        const auto stop = Executor(quantized).run(quantized_cpu, 1);
-        require_guest_fault(stop, "non-zero psq_l GQR index is unsupported");
-        test::require(stop.fault_address == kCode &&
-                          stop.fault_access ==
-                              nwii::runtime::MemoryAccess::execute,
-                      "unmodeled psq_l GQR rejects before guest memory access");
+        quantized_cpu.gpr[8] = 0x02070000;
+        const auto stop = Executor(quantized).run(quantized_cpu, 2);
+        test::require(quantized_cpu.gqr[7] == 0x02070000,
+                      "mtspr UGQR7 programs GQR7");
+        test::require(std::bit_cast<double>(quantized_cpu.fpr[7][0]) == -2.0 &&
+                          std::bit_cast<double>(quantized_cpu.fpr[7][1]) == 1.5,
+                      "psq_l honours a reprogrammed GQR type and scale");
+        (void)stop;
     }
 
     auto reserved_stfdu = make_image({d_form(55, 13, 0, 8)});
@@ -1949,16 +1955,18 @@ void test_startup_float_forms() {
                       image.memory.read32(kData + 0x74, 0) == 0xDEADBEEF,
                   "psq_st W=1 stores only the first lane");
     {
-        auto quantized = make_image({0xF1A11010}); // psq_st with I=1 (GQR1)
+        // psq_st f13,16(r1),0,GQR7 with GQR7 = U8, ST_SCALE 1 (x2).
+        auto quantized = make_image({0xF1A17010});
         CPUContext quantized_cpu;
         quantized_cpu.pc = kCode;
         quantized_cpu.gpr[1] = kData;
-        const auto stop = Executor(quantized).run(quantized_cpu, 1);
-        require_guest_fault(stop, "non-zero psq_st GQR index is unsupported");
-        test::require(stop.fault_address == kCode &&
-                          stop.fault_access ==
-                              nwii::runtime::MemoryAccess::execute,
-                      "unmodeled psq_st GQR rejects before guest memory access");
+        quantized_cpu.gqr[7] = 0x00000104;
+        quantized_cpu.fpr[13][0] = double_bits(3.0);
+        quantized_cpu.fpr[13][1] = double_bits(100.0);
+        (void)Executor(quantized).run(quantized_cpu, 1);
+        test::require(quantized.memory.read8(kData + 16, 0) == 6 &&
+                          quantized.memory.read8(kData + 17, 0) == 200,
+                      "psq_st honours a reprogrammed GQR type and scale");
     }
 }
 
@@ -2083,8 +2091,9 @@ void test_ps_sum1_operand_lanes() {
         auto image = make_image({spr_form(3, 898, 339)});
         CPUContext cpu;
         cpu.pc = kCode;
-        require_guest_fault(Executor(image).run(cpu, 1),
-                            "mfspr 898 remains unsupported");
+        (void)Executor(image).run(cpu, 1);
+        test::require(cpu.gpr[3] == 0x00040004,
+                      "mfspr UGQR2 reads the Cafe OS default U8 GQR");
     }
     for (const uint32_t word :
          {x_form(31, 3, 4, 1, 26), x_form(31, 3, 4, 1, 104)}) {

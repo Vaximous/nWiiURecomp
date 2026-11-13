@@ -138,8 +138,16 @@ void clear_color_surface(GuestMemory& memory, uint32_t descriptor,
     const uint32_t image = read_be32(memory, descriptor + 0x24, pc);
     if ((format != 0x19 && format != 0x1A) || image == 0 ||
         image_size == 0) {
-        throw GuestFault("unsupported GX2 color clear surface", descriptor,
-                         kColorBufferSize, pc, MemoryAccess::read);
+        // Other formats (UE3's float/10:10:10:2 scene targets) are cleared
+        // by the renderer only. Throwing here used to drop the clear event,
+        // so the renderer never cleared those targets either.
+        static bool logged = false;
+        if (!logged) {
+            logged = true;
+            std::fprintf(stderr, "GX2ClearColor: renderer-only clear, fmt=%X\n",
+                         format);
+        }
+        return;
     }
     std::array<uint8_t, 4> rgba{
         unorm8(color[0]), unorm8(color[1]), unorm8(color[2]),
@@ -791,8 +799,69 @@ void copy_surface(GuestMemory& memory, CPUContext& cpu) {
         destination_aa != 0 || source_width == 0 || source_height == 0 ||
         destination_width == 0 || destination_height == 0 ||
         !supported_mode(source_mode) || !supported_mode(destination_mode)) {
-        throw GuestFault("unsupported GX2CopySurface layout", source,
-                         surface_size, pc, MemoryAccess::read);
+        // Beyond the WWHD subset (mips, slices, BCn, other tilings): when
+        // both surfaces share one layout the copy is a byte copy of the
+        // selected level; anything else is dropped with a one-time note
+        // rather than halting the title.
+        const uint32_t source_level = cpu.gpr[4];
+        const uint32_t destination_level = cpu.gpr[7];
+        const bool same_layout =
+            source_format == destination_format &&
+            source_width == destination_width &&
+            source_height == destination_height &&
+            source_mode == destination_mode &&
+            source_pitch == destination_pitch &&
+            source_aa == destination_aa &&
+            source_level == destination_level &&
+            cpu.gpr[5] == cpu.gpr[8];
+        const auto level_range = [&memory, pc](uint32_t surface,
+                                               uint32_t level)
+            -> std::pair<uint32_t, uint32_t> {
+            if (level == 0) {
+                return {read_be32(memory, surface + 0x24, pc),
+                        read_be32(memory, surface + 0x20, pc)};
+            }
+            const uint32_t levels = read_be32(memory, surface + 0x10, pc);
+            const uint32_t mip_base = read_be32(memory, surface + 0x2C, pc);
+            const uint32_t mip_size = read_be32(memory, surface + 0x28, pc);
+            if (mip_base == 0 || level >= levels || level > 13) {
+                return {0, 0};
+            }
+            const uint32_t begin =
+                level == 1 ? 0
+                           : read_be32(memory, surface + 0x40 + (level - 1) * 4,
+                                       pc);
+            const uint32_t end =
+                level + 1 < levels && level < 13
+                    ? read_be32(memory, surface + 0x40 + level * 4, pc)
+                    : mip_size;
+            if (end <= begin || end > mip_size) {
+                return {0, 0};
+            }
+            return {mip_base + begin, end - begin};
+        };
+        if (same_layout && cpu.gpr[5] == 0) {
+            const auto [from, bytes] = level_range(source, source_level);
+            const auto [to, capacity] =
+                level_range(destination, destination_level);
+            if (from != 0 && to != 0 && bytes != 0 && bytes == capacity) {
+                std::vector<uint8_t> buffer(bytes);
+                memory.read_bytes(from, buffer, pc);
+                memory.write_bytes(to, buffer, pc);
+                return;
+            }
+        }
+        static unsigned reported = 0;
+        if (reported++ < 8) {
+            std::fprintf(stderr,
+                         "GX2CopySurface skipped: fmt %X->%X %ux%u->%ux%u "
+                         "mode %u->%u level %u->%u slice %u->%u\n",
+                         source_format, destination_format, source_width,
+                         source_height, destination_width, destination_height,
+                         source_mode, destination_mode, source_level,
+                         destination_level, cpu.gpr[5], cpu.gpr[8]);
+        }
+        return;
     }
 
     const auto required_size = [bytes_per_element](
@@ -1944,10 +2013,13 @@ void Gx2Runtime::register_handlers(CafeRuntime& runtime) {
             if (read_be32(memory_, cpu.gpr[3] + 0x7C, cpu.pc) == 0) {
                 write_be32(memory_, cpu.gpr[3] + 0x7C, 1, cpu.pc);
             }
-            copy_color_buffer_to_scan(
-                cpu.gpr[3],
-                target == 1 ? state_.tv_scan_buffer : state_.drc_scan_buffer,
-                cpu.pc);
+            if (!host_owns_surfaces()) {
+                copy_color_buffer_to_scan(
+                    cpu.gpr[3],
+                    target == 1 ? state_.tv_scan_buffer
+                                : state_.drc_scan_buffer,
+                    cpu.pc);
+            }
             state_.last_scan_copy = {true, {cpu.gpr[3], target}};
             ++state_.scan_copy_count;
             notify(Gx2Event::copy_scan_buffer);
@@ -2394,7 +2466,9 @@ void Gx2Runtime::register_handlers(CafeRuntime& runtime) {
             memory_.validate_range(cpu.gpr[3], kColorBufferSize, cpu.pc,
                                    MemoryAccess::read);
             const auto color = float_arguments<4>(cpu);
-            clear_color_surface(memory_, cpu.gpr[3], color, cpu.pc);
+            if (!host_owns_surfaces()) {
+                clear_color_surface(memory_, cpu.gpr[3], color, cpu.pc);
+            }
             state_.last_color_clear =
                 {true, {cpu.gpr[3], color[0], color[1], color[2], color[3]}};
             ++state_.color_clear_count;
@@ -2409,9 +2483,11 @@ void Gx2Runtime::register_handlers(CafeRuntime& runtime) {
             memory_.validate_range(cpu.gpr[4], kDepthBufferSize, cpu.pc,
                                    MemoryAccess::read);
             const auto values = float_arguments<5>(cpu);
-            clear_color_surface(
-                memory_, cpu.gpr[3],
-                {values[0], values[1], values[2], values[3]}, cpu.pc);
+            if (!host_owns_surfaces()) {
+                clear_color_surface(
+                    memory_, cpu.gpr[3],
+                    {values[0], values[1], values[2], values[3]}, cpu.pc);
+            }
             state_.last_color_clear =
                 {true,
                  {cpu.gpr[3], values[0], values[1], values[2], values[3]}};

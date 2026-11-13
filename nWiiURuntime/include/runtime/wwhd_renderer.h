@@ -3,7 +3,10 @@
 #include "runtime/cafe_runtime.h"
 #include "runtime/execution_image.h"
 #include "runtime/gx2_runtime.h"
+#include "runtime/host_sync.h"
 #include "runtime/latte_shader.h"
+#include "runtime/pc_glyphs.h"
+#include "runtime/pc_input.h"
 #include "runtime/wwhd_gpu.h"
 
 #include <SDL3/SDL.h>
@@ -11,6 +14,7 @@
 #include <algorithm>
 #include <array>
 #include <bit>
+#include <chrono>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -22,6 +26,8 @@
 #include <stdexcept>
 #include <string>
 #include <tuple>
+#include <unordered_map>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -34,13 +40,31 @@ public:
         if (!SDL_Init(SDL_INIT_VIDEO | SDL_INIT_AUDIO)) {
             fail("SDL_Init");
         }
-        window_ = SDL_CreateWindow("The Wind Waker HD", 1280, 720,
-                                   SDL_WINDOW_RESIZABLE);
+        const char* title = std::getenv("NWIIU_WINDOW_TITLE");
+        window_ = SDL_CreateWindow(title != nullptr ? title : "nWiiURecomp",
+                                   1280, 720, SDL_WINDOW_RESIZABLE);
         if (window_ == nullptr) {
             SDL_Quit();
             fail("SDL_CreateWindow");
         }
-        renderer_ = SDL_CreateRenderer(window_, "vulkan");
+        gpu_ = std::make_unique<WwhdGpu>();
+        // Sharing the SDL_GPU device lets scan-out copy the rendered frame
+        // GPU-to-GPU; a separate Vulkan renderer forced a full readback and
+        // re-upload of every presented frame.
+        if (std::getenv("NWIIU_SEPARATE_RENDERER") == nullptr) {
+            renderer_ = SDL_CreateGPURenderer(gpu_->device(), window_);
+            shared_device_ = renderer_ != nullptr;
+        }
+        if (renderer_ == nullptr) {
+            renderer_ = SDL_CreateRenderer(window_, "vulkan");
+        }
+        if (renderer_ != nullptr) {
+            // The game paces itself; presenting without vsync lets frames
+            // run past the display refresh when the host is fast enough.
+            const char* vsync = std::getenv("NWIIU_VSYNC");
+            SDL_SetRenderVSync(renderer_,
+                               vsync != nullptr ? std::atoi(vsync) : 0);
+        }
         if (renderer_ == nullptr) {
             SDL_DestroyWindow(window_);
             window_ = nullptr;
@@ -63,12 +87,14 @@ public:
             SDL_Quit();
             fail("SDL audio");
         }
-        gpu_ = std::make_unique<WwhdGpu>();
         cafe_.set_vpad_buttons(0);
-        gx2_.attach_event_callback(this, render_event);
+        glyphs_.set_labeler(
+            [this](const std::string& button) { return input_.label(button); });
+        gx2_.attach_event_callback(this, render_event_on_main);
     }
 
     ~WwhdRenderer() {
+        host_sync::shutdown();
         gx2_.attach_event_callback(nullptr, nullptr);
         for (const auto& [address, target] : targets_) {
             (void)address;
@@ -98,30 +124,18 @@ public:
             if (event.type == SDL_EVENT_QUIT) {
                 return false;
             }
+            if (event.type == SDL_EVENT_KEY_DOWN && !event.key.repeat &&
+                event.key.scancode == SDL_SCANCODE_F11) {
+                const bool fullscreen =
+                    (SDL_GetWindowFlags(window_) & SDL_WINDOW_FULLSCREEN) != 0;
+                SDL_SetWindowFullscreen(window_, !fullscreen);
+            }
+            input_.handle_event(window_, event);
         }
-        const bool* key = SDL_GetKeyboardState(nullptr);
-        uint32_t buttons = 0;
-        if (key[SDL_SCANCODE_P]) {
-            buttons |= 1u << 3;
-        }
-        if (key[SDL_SCANCODE_DOWN]) {
-            buttons |= 1u << 8;
-        }
-        if (key[SDL_SCANCODE_UP]) {
-            buttons |= 1u << 9;
-        }
-        if (key[SDL_SCANCODE_RIGHT]) {
-            buttons |= 1u << 10;
-        }
-        if (key[SDL_SCANCODE_LEFT]) {
-            buttons |= 1u << 11;
-        }
-        if (key[SDL_SCANCODE_ESCAPE]) {
-            buttons |= 1u << 14;
-        }
-        if (key[SDL_SCANCODE_RETURN] || key[SDL_SCANCODE_SPACE]) {
-            buttons |= 1u << 15;
-        }
+        const auto pad = input_.poll();
+        uint32_t buttons = pad.buttons;
+        host_sync::HleLock hle_lock;
+        cafe_.set_vpad_sticks(pad.lx, pad.ly, pad.rx, pad.ry);
         if (std::getenv("NWIIU_AUTO_A") != nullptr && swap_count_ < 2 &&
             (SDL_GetTicks() / 500) % 2 == 0) {
             buttons |= 1u << 15;
@@ -129,6 +143,15 @@ public:
         if (std::getenv("NWIIU_AUTO_START") != nullptr &&
             (SDL_GetTicks() / 500) % 2 == 0) {
             buttons |= 1u << 3;
+        }
+        // NWIIU_AUTO_A_AFTER=<swap>: pulse A from that frame on, to walk
+        // past the brightness/title screens unattended.
+        static const uint64_t auto_a_after = [] {
+            const char* value = std::getenv("NWIIU_AUTO_A_AFTER");
+            return value ? std::strtoull(value, nullptr, 10) : ~uint64_t{0};
+        }();
+        if (swap_count_ >= auto_a_after && (SDL_GetTicks() / 700) % 3 == 0) {
+            buttons |= 1u << 15;
         }
         cafe_.set_vpad_buttons(buttons);
         return true;
@@ -528,6 +551,53 @@ private:
                     (surface.format & 0x3Fu) == 0x19 ? c0 : c2;
                 pixels[destination + 3] =
                     image_.memory.read8(surface.image + source + 3, 0);
+            }
+        }
+    }
+
+    // 16_16_16_16 (0x20), half-float when the 0x800 bit is set (UE3's HDR
+    // scene colour). GPU surfaces are little-endian; values clamp to 8 bits.
+    void decode_rgba16(const Surface& surface,
+                       std::vector<uint8_t>& pixels) const {
+        const bool is_float = (surface.format & 0x800u) != 0;
+        for (uint32_t y = 0; y < surface.height; ++y) {
+            for (uint32_t x = 0; x < surface.width; ++x) {
+                const uint32_t source = tiled_offset(
+                    x, y, surface.pitch, surface.mode, surface.swizzle, 8);
+                if (source + 8 > surface.image_size) {
+                    throw std::runtime_error(
+                        "RGBA16 pixel exceeds GX2 surface");
+                }
+                const size_t destination =
+                    (static_cast<size_t>(y) * surface.width + x) * 4;
+                for (uint32_t c = 0; c < 4; ++c) {
+                    const uint32_t lo =
+                        image_.memory.read8(surface.image + source + c * 2, 0);
+                    const uint32_t hi = image_.memory.read8(
+                        surface.image + source + c * 2 + 1, 0);
+                    const uint32_t raw = lo | (hi << 8);
+                    float value;
+                    if (is_float) {
+                        const uint32_t sign = (raw & 0x8000u) << 16;
+                        const uint32_t exponent = (raw >> 10) & 0x1Fu;
+                        const uint32_t mantissa = raw & 0x3FFu;
+                        uint32_t bits = sign;
+                        if (exponent == 31) {
+                            bits |= 0x7F800000u | (mantissa << 13);
+                        } else if (exponent != 0) {
+                            bits |= ((exponent + 112u) << 23) |
+                                    (mantissa << 13);
+                        }
+                        value = std::bit_cast<float>(bits);
+                    } else {
+                        value = static_cast<float>(raw) / 65535.0f;
+                    }
+                    if (!(value > 0.0f)) {
+                        value = 0.0f;
+                    }
+                    pixels[destination + c] = static_cast<uint8_t>(
+                        std::min(value, 1.0f) * 255.0f + 0.5f);
+                }
             }
         }
     }
@@ -945,6 +1015,7 @@ private:
         case 0x19:
         case 0x1A: decode_rgba8(value, pixels); break;
         case 0x0E: decode_r32_float(value, pixels); break;
+        case 0x20: decode_rgba16(value, pixels); break;
         case 0x31: decode_bc1(value, pixels); break;
         case 0x33: decode_bc3(value, pixels); break;
         case 0x34: decode_bc4(value, pixels); break;
@@ -958,32 +1029,83 @@ private:
         return pixels;
     }
 
+    static uint64_t pixel_hash(std::span<const uint8_t> pixels) {
+        uint64_t hash = 1469598103934665603ull;
+        for (size_t i = 0; i + 8 <= pixels.size(); i += 8) {
+            uint64_t word;
+            std::memcpy(&word, pixels.data() + i, sizeof word);
+            hash = (hash ^ word) * 1099511628211ull;
+        }
+        return hash;
+    }
+
+    // NWIIU_TEXTURE_DUMP=<dir>: every distinct sampled texture up to 512x512
+    // is written once as <hash>_<w>x<h>_<fmt>.bmp, to find the pad-button
+    // icons the glyph table below replaces.
+    void apply_glyph_override(const Surface& value,
+                              std::vector<uint8_t>& pixels) {
+        const uint64_t hash = pixel_hash(pixels);
+        static const char* dump_dir = std::getenv("NWIIU_TEXTURE_DUMP");
+        if (dump_dir != nullptr && value.width <= 512 &&
+            value.height <= 512 && dumped_textures_.insert(hash).second) {
+            std::filesystem::create_directories(dump_dir);
+            if (SDL_Surface* surface = SDL_CreateSurfaceFrom(
+                    static_cast<int>(value.width),
+                    static_cast<int>(value.height), SDL_PIXELFORMAT_RGBA32,
+                    pixels.data(), static_cast<int>(value.width * 4));
+                surface != nullptr) {
+                char name[96];
+                std::snprintf(name, sizeof name, "%016llX_%ux%u_%X.bmp",
+                              static_cast<unsigned long long>(hash),
+                              value.width, value.height, value.format);
+                SDL_SaveBMP(surface,
+                            (std::filesystem::path(dump_dir) / name)
+                                .string()
+                                .c_str());
+                SDL_DestroySurface(surface);
+            }
+        }
+        glyphs_.apply(hash, value.width, value.height, pixels);
+    }
+
     WwhdGpu::Texture gpu_sampled_texture(uint32_t descriptor) {
         if (descriptor == 0) {
             return {};
         }
         const auto value = surface(descriptor);
-        const auto target_key_value = target_key(value);
-        if (const auto target = gpu_targets_.find(target_key_value);
-            target != gpu_targets_.end()) {
-            // ponytail: CPU snapshot avoids render-target sampling hazards;
-            // replace with a GPU copy when this path is performance-critical.
-            const auto pixels = gpu_->download(target->second);
-            if (std::getenv("NWIIU_GPU_SOURCE_TRACE") != nullptr) {
-                std::fprintf(stderr,
-                             "GPU-SOURCE target image=%08X first=%u,%u,%u,%u\n",
-                             value.image, pixels[0], pixels[1], pixels[2],
-                             pixels[3]);
+        auto target_key_value = target_key(value);
+        auto target = gpu_targets_.find(target_key_value);
+        if (target == gpu_targets_.end() && value.image != 0) {
+            // A texture view of a render target rarely matches the colour
+            // buffer descriptor field-for-field (swizzle, image size and
+            // tile mode differ between GX2ColorBuffer and GX2Texture), so
+            // fall back to the same memory and dimensions.
+            for (auto it = gpu_targets_.begin(); it != gpu_targets_.end();
+                 ++it) {
+                if (std::get<0>(it->first) == value.image &&
+                    std::get<1>(it->first) == value.width &&
+                    std::get<2>(it->first) == value.height) {
+                    target = it;
+                    target_key_value = it->first;
+                    break;
+                }
             }
-            if (auto snapshot = gpu_sample_copies_.find(target_key_value);
-                snapshot != gpu_sample_copies_.end()) {
-                gpu_->upload(snapshot->second, pixels);
-                return snapshot->second;
+        }
+        if (target != gpu_targets_.end()) {
+            // Snapshot (avoids sampling the texture being rendered to) via a
+            // GPU copy. This used to download and re-upload through the CPU
+            // with two idle waits, dozens of times per UE3 frame.
+            auto snapshot = gpu_sample_copies_.find(target_key_value);
+            if (snapshot == gpu_sample_copies_.end()) {
+                snapshot = gpu_sample_copies_
+                               .emplace(target_key_value,
+                                        gpu_->create_target(
+                                            target->second.width,
+                                            target->second.height))
+                               .first;
             }
-            return gpu_sample_copies_
-                .emplace(target_key_value,
-                         gpu_->create_texture(value.width, value.height, pixels))
-                .first->second;
+            gpu_->copy(target->second, snapshot->second);
+            return snapshot->second;
         }
         if (value.image == 0) {
             if (gpu_null_texture_.handle == nullptr) {
@@ -1002,6 +1124,7 @@ private:
             return found->second;
         }
         auto pixels = decoded_pixels(value);
+        apply_glyph_override(value, pixels);
         if (std::getenv("NWIIU_GPU_DEBUG_SAMPLE") != nullptr &&
             value.image == 0x1EB65000) {
             for (size_t offset = 0; offset < pixels.size(); offset += 4) {
@@ -1049,7 +1172,7 @@ private:
     }
 
 
-    LatteTranslation translate_shader(const Gx2State& state) {
+    const LatteTranslation& translate_shader(const Gx2State& state) {
         const auto words = [this](uint32_t address, uint32_t count) {
             std::vector<uint32_t> values(count);
             for (uint32_t i = 0; i < count; ++i) {
@@ -1072,7 +1195,108 @@ private:
         const auto vs = bytes(state.vertex_shader_address, 0xD0, 0xD4);
         const auto ps = bytes(state.pixel_shader_address, 0xA4, 0xA8);
         const auto fs = bytes(state.fetch_shader_address, 0x08, 0x0C);
-        return translate_latte({vs_regs, vs, ps_regs, ps, fs});
+        // Translation compiles GLSL to SPIR-V; doing that on every draw cost
+        // seconds per UE3 frame. Cache by a hash of everything it reads.
+        uint64_t hash = 1469598103934665603ull;
+        const auto mix = [&hash](const void* data, size_t size) {
+            const auto* p = static_cast<const uint8_t*>(data);
+            for (size_t i = 0; i < size; ++i) {
+                hash = (hash ^ p[i]) * 1099511628211ull;
+            }
+            hash = (hash ^ size) * 1099511628211ull;
+        };
+        mix(vs_regs.data(), vs_regs.size() * 4);
+        mix(ps_regs.data(), ps_regs.size() * 4);
+        mix(vs.data(), vs.size());
+        mix(ps.data(), ps.size());
+        mix(fs.data(), fs.size());
+        auto found = translation_cache_.find(hash);
+        if (found == translation_cache_.end()) {
+            CachedTranslation entry;
+            try {
+                entry.value = translate_latte({vs_regs, vs, ps_regs, ps, fs});
+                entry.ok = true;
+            } catch (const std::exception& error) {
+                entry.error = error.what();
+            }
+            found = translation_cache_.emplace(hash, std::move(entry)).first;
+        }
+        if (!found->second.ok) {
+            throw std::runtime_error(found->second.error);
+        }
+        return found->second.value;
+    }
+
+    static SDL_GPUBlendFactor gpu_blend_factor(uint32_t mode) {
+        // GX2BlendMode
+        switch (mode) {
+        case 0: return SDL_GPU_BLENDFACTOR_ZERO;
+        case 1: return SDL_GPU_BLENDFACTOR_ONE;
+        case 2: return SDL_GPU_BLENDFACTOR_SRC_COLOR;
+        case 3: return SDL_GPU_BLENDFACTOR_ONE_MINUS_SRC_COLOR;
+        case 4: return SDL_GPU_BLENDFACTOR_SRC_ALPHA;
+        case 5: return SDL_GPU_BLENDFACTOR_ONE_MINUS_SRC_ALPHA;
+        case 6: return SDL_GPU_BLENDFACTOR_DST_ALPHA;
+        case 7: return SDL_GPU_BLENDFACTOR_ONE_MINUS_DST_ALPHA;
+        case 8: return SDL_GPU_BLENDFACTOR_DST_COLOR;
+        case 9: return SDL_GPU_BLENDFACTOR_ONE_MINUS_DST_COLOR;
+        case 10: return SDL_GPU_BLENDFACTOR_SRC_ALPHA_SATURATE;
+        case 13: return SDL_GPU_BLENDFACTOR_CONSTANT_COLOR;
+        case 14: return SDL_GPU_BLENDFACTOR_ONE_MINUS_CONSTANT_COLOR;
+        default: return SDL_GPU_BLENDFACTOR_ONE;
+        }
+    }
+
+    static SDL_GPUBlendOp gpu_blend_op(uint32_t combine) {
+        // GX2BlendCombineMode
+        switch (combine) {
+        case 1: return SDL_GPU_BLENDOP_SUBTRACT;
+        case 2: return SDL_GPU_BLENDOP_MIN;
+        case 3: return SDL_GPU_BLENDOP_MAX;
+        case 4: return SDL_GPU_BLENDOP_REVERSE_SUBTRACT;
+        default: return SDL_GPU_BLENDOP_ADD;
+        }
+    }
+
+    // GX2SetColorControl's per-target enable mask plus GX2SetBlendControl's
+    // factors for target 0. The pipeline used to hard-code blending off,
+    // which drew Scaleform glyph quads as solid blocks.
+    static SDL_GPUColorTargetBlendState gpu_blend_state(const Gx2State& state) {
+        SDL_GPUColorTargetBlendState blend = WwhdGpu::default_blend();
+        const bool enabled = state.color_control.valid &&
+                             (state.color_control.args[1] & 1u) != 0;
+        const auto& control = state.blend_controls[0];
+        if (enabled && control.valid) {
+            const auto& a = control.args;
+            blend.src_color_blendfactor = gpu_blend_factor(a[1]);
+            blend.dst_color_blendfactor = gpu_blend_factor(a[2]);
+            blend.color_blend_op = gpu_blend_op(a[3]);
+            if (a[4] != 0) {
+                blend.src_alpha_blendfactor = gpu_blend_factor(a[5]);
+                blend.dst_alpha_blendfactor = gpu_blend_factor(a[6]);
+                blend.alpha_blend_op = gpu_blend_op(a[7]);
+            } else {
+                blend.src_alpha_blendfactor = blend.src_color_blendfactor;
+                blend.dst_alpha_blendfactor = blend.dst_color_blendfactor;
+                blend.alpha_blend_op = blend.color_blend_op;
+            }
+            blend.enable_blend = true;
+        }
+        if (state.target_channel_masks.valid &&
+            (state.target_channel_masks.args[0] & 0xFu) != 0xFu) {
+            blend.color_write_mask = static_cast<SDL_GPUColorComponentFlags>(
+                state.target_channel_masks.args[0] & 0xFu);
+            blend.enable_color_write_mask = true;
+        }
+        return blend;
+    }
+
+    // NWIIU_DRAW_STATS=1: per-50-swap tally of what happened to each draw.
+    void draw_stat(const std::string& outcome) {
+        static const bool enabled = std::getenv("NWIIU_DRAW_STATS") != nullptr;
+        if (enabled) {
+            ++draw_stats_[outcome];
+        }
     }
 
     static std::pair<SDL_GPUVertexElementFormat, uint32_t>
@@ -1096,8 +1320,18 @@ private:
         if (state.vertex_shader_address == 0 ||
             state.pixel_shader_address == 0 ||
             state.fetch_shader_address == 0) {
+            draw_stat("gpu: no shader bound");
             return false;
         }
+        try {
+            return gpu_draw_inner(state, software_target);
+        } catch (const std::exception& error) {
+            draw_stat(std::string("gpu: ") + error.what());
+            return false;
+        }
+    }
+
+    bool gpu_draw_inner(const Gx2State& state, SDL_Texture* software_target) {
         if (const char* skip = std::getenv("NWIIU_GPU_SKIP_SHADER");
             skip != nullptr) {
             const uint32_t address =
@@ -1107,12 +1341,18 @@ private:
                 return false;
             }
         }
-        LatteTranslation translated;
+        const LatteTranslation* translated_ptr = nullptr;
         try {
-            translated = translate_shader(state);
-        } catch (const std::exception&) {
+            translated_ptr = &translate_shader(state);
+        } catch (const std::exception& error) {
+            std::string what = error.what();
+            if (what.size() > 120) {
+                what.resize(120);
+            }
+            draw_stat("translate: " + what);
             return false;
         }
+        const LatteTranslation& translated = *translated_ptr;
         if (std::getenv("NWIIU_RENDER_TRACE") != nullptr &&
             state.draw_count <= 40) {
             std::fprintf(
@@ -1125,37 +1365,107 @@ private:
                 translated.ps_sampler_slots.size());
         }
 
+        // Only the vertices this draw references are decoded, rebased to 0.
+        // UE3 feeds many small draws from multi-megabyte dynamic buffers;
+        // decoding each whole buffer per draw cost ~7 ms a draw.
+        const auto source_indices = draw_indices(state.last_draw);
+        uint32_t first_vertex = ~0u;
+        uint32_t last_vertex = 0;
+        for (const uint32_t index : source_indices) {
+            first_vertex = std::min(first_vertex, index);
+            last_vertex = std::max(last_vertex, index);
+        }
+        if (source_indices.empty()) {
+            first_vertex = 0;
+        }
+        const uint32_t vertex_count =
+            source_indices.empty() ? 0 : last_vertex - first_vertex + 1;
+
         std::vector<WwhdGpu::VertexStream> streams;
         streams.reserve(translated.vertex_inputs.size());
         for (const auto& input : translated.vertex_inputs) {
             if (input.buffer >= state.attribute_buffers.size()) {
+                draw_stat("gpu: attribute buffer index out of range");
                 return false;
             }
-            const auto& source = state.attribute_buffers[input.buffer];
-            if (!source.valid || source.stride == 0) {
+            auto source = state.attribute_buffers[input.buffer];
+            if (!source.valid || source.size == 0) {
+                draw_stat("gpu: attribute buffer unbound");
                 return false;
             }
-            const auto [format, components] =
-                gpu_vertex_format(input.data_format);
-            const uint32_t vertices = source.size / source.stride;
+            if (source.stride == 0) {
+                // A constant attribute: every vertex reads the same element.
+                // Expand it to one copy per vertex the draw can reference.
+                const uint32_t element =
+                    latte_vertex_element_size(input.data_format);
+                const uint32_t count = std::max(vertex_count, 1u);
+                std::vector<uint8_t> one(element);
+                image_.memory.read_bytes(source.address + input.offset, one,
+                                         0);
+                const auto decoded = decode_latte_vertex_element(one, input);
+                const uint32_t comps =
+                    latte_vertex_components(input.data_format);
+                static constexpr std::array<SDL_GPUVertexElementFormat, 4>
+                    kConstFormats{SDL_GPU_VERTEXELEMENTFORMAT_FLOAT,
+                                  SDL_GPU_VERTEXELEMENTFORMAT_FLOAT2,
+                                  SDL_GPU_VERTEXELEMENTFORMAT_FLOAT3,
+                                  SDL_GPU_VERTEXELEMENTFORMAT_FLOAT4};
+                WwhdGpu::VertexStream stream{input.semantic,
+                                             kConstFormats[comps - 1],
+                                             comps * 4, {}};
+                stream.data.resize(static_cast<size_t>(count) * comps * 4);
+                for (uint32_t v = 0; v < count; ++v) {
+                    std::memcpy(stream.data.data() +
+                                    static_cast<size_t>(v) * comps * 4,
+                                decoded.data(), comps * 4);
+                }
+                streams.push_back(std::move(stream));
+                continue;
+            }
+            const uint32_t components =
+                latte_vertex_components(input.data_format);
+            const uint32_t element_size =
+                latte_vertex_element_size(input.data_format);
+            static constexpr std::array<SDL_GPUVertexElementFormat, 4>
+                kFloatFormats{SDL_GPU_VERTEXELEMENTFORMAT_FLOAT,
+                              SDL_GPU_VERTEXELEMENTFORMAT_FLOAT2,
+                              SDL_GPU_VERTEXELEMENTFORMAT_FLOAT3,
+                              SDL_GPU_VERTEXELEMENTFORMAT_FLOAT4};
+            const auto format = kFloatFormats[components - 1];
+            const uint32_t buffer_vertices = source.size / source.stride;
+            const uint32_t vertices =
+                first_vertex >= buffer_vertices
+                    ? 0
+                    : std::min(vertex_count, buffer_vertices - first_vertex);
             WwhdGpu::VertexStream stream{
                 input.semantic, format, components * 4, {}};
-            stream.data.resize(static_cast<size_t>(vertices) *
+            stream.data.resize(static_cast<size_t>(std::max(vertex_count, 1u)) *
                                stream.pitch);
+            // One bulk read of just the referenced span of the buffer.
+            const size_t span_offset =
+                static_cast<size_t>(first_vertex) * source.stride;
+            const size_t span_bytes = std::min<size_t>(
+                static_cast<size_t>(vertices) * source.stride,
+                source.size - std::min<size_t>(span_offset, source.size));
+            vertex_scratch_.resize(span_bytes);
+            if (span_bytes != 0) {
+                image_.memory.read_bytes(
+                    source.address + static_cast<uint32_t>(span_offset),
+                    vertex_scratch_, 0);
+            }
             for (uint32_t vertex = 0; vertex < vertices; ++vertex) {
-                for (uint32_t component = 0; component < components;
-                     ++component) {
-                    const uint32_t value = decode_latte_vertex_word(
-                        image_.memory.read32(
-                            source.address + vertex * source.stride +
-                                input.offset + component * 4,
-                            0),
-                        input.endian);
-                    std::memcpy(stream.data.data() +
-                                    static_cast<size_t>(vertex) * stream.pitch +
-                                    component * 4,
-                                &value, 4);
+                const size_t at =
+                    static_cast<size_t>(vertex) * source.stride + input.offset;
+                if (at + element_size > vertex_scratch_.size()) {
+                    break;
                 }
+                const auto decoded = decode_latte_vertex_element(
+                    std::span<const uint8_t>(vertex_scratch_.data() + at,
+                                             element_size),
+                    input);
+                std::memcpy(stream.data.data() +
+                                static_cast<size_t>(vertex) * stream.pitch,
+                            decoded.data(), components * 4);
             }
             streams.push_back(std::move(stream));
         }
@@ -1185,19 +1495,19 @@ private:
             }
         }
 
-        const auto source_indices = draw_indices(state.last_draw);
         const auto triangles =
             triangle_indices(state.last_draw.mode, source_indices);
         std::vector<uint32_t> indices;
         indices.reserve(triangles.size());
-        for (const int index : triangles) {
-            indices.push_back(static_cast<uint32_t>(index));
+        for (const auto index : triangles) {
+            indices.push_back(static_cast<uint32_t>(index) - first_vertex);
         }
         std::vector<WwhdGpu::Texture> sampled;
         sampled.reserve(translated.ps_sampler_slots.size());
         for (const uint32_t slot : translated.ps_sampler_slots) {
             if (slot >= state.pixel_texture_addresses.size() ||
                 state.pixel_texture_addresses[slot] == 0) {
+                draw_stat("gpu: sampler slot unbound");
                 return false;
             }
             try {
@@ -1216,6 +1526,7 @@ private:
                         value.width, value.height, value.pitch, value.image_size,
                         value.format, value.mode, error.what());
                 }
+                draw_stat(std::string("gpu texture: ") + error.what());
                 return false;
             }
         }
@@ -1269,10 +1580,19 @@ private:
                              static_cast<unsigned long long>(state.draw_count),
                              error.what());
             }
+            draw_stat(std::string("gpu uniforms: ") + error.what());
             return false;
         }
         auto& output =
             gpu_target(state.color_buffers[0].args[0], software_target);
+        {
+            const auto target_value = surface(state.color_buffers[0].args[0]);
+            char label[96];
+            std::snprintf(label, sizeof label, "gpu ok -> fmt=%X %ux%u",
+                          target_value.format, target_value.width,
+                          target_value.height);
+            draw_stat(label);
+        }
         if (const auto clear = pending_clears_.find(software_target);
             clear != pending_clears_.end()) {
             gpu_->clear(output, clear->second);
@@ -1294,7 +1614,7 @@ private:
              state.fetch_shader_address},
             translated, output, streams, indices,
             vertex_uniforms, pixel_uniforms,
-            sampled);
+            sampled, gpu_blend_state(state));
         if (std::getenv("NWIIU_GPU_OUTPUT_TRACE") != nullptr &&
             state.draw_count <= 40) {
             const auto pixels = gpu_->download(output);
@@ -1378,6 +1698,9 @@ private:
         }
         if (!state.color_buffers[0].valid ||
             !state.attribute_buffers[0].valid) {
+            draw_stat(state.color_buffers[0].valid
+                          ? "skip: attribute buffer 0 unbound"
+                          : "skip: color buffer 0 unbound");
             return;
         }
         trace_shader(state);
@@ -1385,6 +1708,16 @@ private:
         if (gpu_draw(state, output.texture)) {
             return;
         }
+        if (state.attribute_buffers[0].stride != 8 &&
+            state.attribute_buffers[0].stride != 32) {
+            // The SDL fallback below cannot draw this layout. Checked before
+            // sync_gpu_target, which would otherwise read back and drop the
+            // GPU target (and everything already drawn into it) per draw.
+            draw_stat("sdl: skipped stride " +
+                      std::to_string(state.attribute_buffers[0].stride));
+            return;
+        }
+        draw_stat("sdl: fallback draw");
         sync_gpu_target(surface(state.color_buffers[0].args[0]),
                         output.texture);
         apply_pending_clear(output.texture);
@@ -1621,9 +1954,12 @@ private:
                 destination.width != value.width ||
                 destination.height != value.height) {
                 SDL_DestroyTexture(destination.texture);
+                // TARGET, not STATIC: the SDL fallback path renders into the
+                // same scan target when a later frame's source is an SDL
+                // target, and SDL refuses to render into a STATIC texture.
                 destination.texture = SDL_CreateTexture(
                     renderer_, SDL_PIXELFORMAT_RGBA32,
-                    SDL_TEXTUREACCESS_STATIC,
+                    SDL_TEXTUREACCESS_TARGET,
                     static_cast<int>(value.width),
                     static_cast<int>(value.height));
                 destination.width = value.width;
@@ -1632,6 +1968,17 @@ private:
                     !SDL_SetTextureScaleMode(destination.texture,
                                              SDL_SCALEMODE_LINEAR)) {
                     fail("SDL GPU scan target");
+                }
+            }
+            if (shared_device_) {
+                auto* handle = static_cast<SDL_GPUTexture*>(
+                    SDL_GetPointerProperty(
+                        SDL_GetTextureProperties(destination.texture),
+                        SDL_PROP_TEXTURE_GPU_TEXTURE_POINTER, nullptr));
+                if (handle != nullptr) {
+                    gpu_->copy(gpu_source->second,
+                               {handle, value.width, value.height});
+                    return;
                 }
             }
             const auto pixels = gpu_->download(gpu_source->second);
@@ -1715,6 +2062,39 @@ private:
 
     void swap(const Gx2State& state) {
         ++swap_count_;
+        if (gpu_ != nullptr) {
+            gpu_->flush();
+        }
+        if (!draw_stats_.empty() && swap_count_ % 50 == 0) {
+            const auto now = std::chrono::steady_clock::now();
+            const double wall_ms =
+                stats_window_start_.time_since_epoch().count() == 0
+                    ? 0.0
+                    : std::chrono::duration<double, std::milli>(
+                          now - stats_window_start_)
+                          .count();
+            stats_window_start_ = now;
+            std::fprintf(stderr,
+                         "DRAWSTATS swaps %llu-%llu: wall=%.0fms render=%.0fms "
+                         "fps=%.2f\n",
+                         static_cast<unsigned long long>(swap_count_ - 49),
+                         static_cast<unsigned long long>(swap_count_), wall_ms,
+                         static_cast<double>(render_ns_) / 1e6,
+                         wall_ms > 0 ? 50000.0 / wall_ms : 0.0);
+            std::fprintf(stderr,
+                         "  render split ms: clear=%.0f draw=%.0f scan=%.0f "
+                         "swap=%.0f\n",
+                         render_event_ns_[0] / 1e6, render_event_ns_[1] / 1e6,
+                         render_event_ns_[2] / 1e6, render_event_ns_[3] / 1e6);
+            render_event_ns_.fill(0);
+            render_ns_ = 0;
+            for (const auto& [outcome, count] : draw_stats_) {
+                std::fprintf(stderr, "  %8llu %s\n",
+                             static_cast<unsigned long long>(count),
+                             outcome.c_str());
+            }
+            draw_stats_.clear();
+        }
         const auto& source = scan_targets_[1];
         static const uint64_t dump_interval = [] {
             const char* value = std::getenv("NWIIU_FRAME_DUMP_INTERVAL");
@@ -1896,6 +2276,26 @@ private:
                 ++it;
             }
         }
+        for (auto it = gpu_textures_.begin(); it != gpu_textures_.end();) {
+            const uint32_t image = std::get<0>(it->first.first);
+            const uint32_t recorded_size = std::get<4>(it->first.first);
+            const uint32_t image_size =
+                recorded_size != 0 ? recorded_size : 0x1000u;
+            bool overlaps = false;
+            for (const auto& [buffer, size] : ranges) {
+                if (size == 0xFFFFFFFFu ||
+                    (image < buffer + size && buffer < image + image_size)) {
+                    overlaps = true;
+                    break;
+                }
+            }
+            if (overlaps && gpu_) {
+                gpu_->release(it->second);
+                it = gpu_textures_.erase(it);
+            } else {
+                ++it;
+            }
+        }
     }
 
     void queue_audio() {
@@ -1909,10 +2309,36 @@ private:
         }
     }
 
+    // NWIIU_PARALLEL: GX2 calls can come from any core worker, but SDL and
+    // the GPU device belong to the main thread.
+    static void render_event_on_main(void* context, Gx2Event event,
+                                     const Gx2State& state) {
+        host_sync::run_on_main(
+            [&] { render_event(context, event, state); });
+    }
+
     static void render_event(void* context, Gx2Event event,
                              const Gx2State& state) {
         auto& self = *static_cast<WwhdRenderer*>(context);
-        const bool dumping = std::getenv("NWIIU_SHADER_DUMP") != nullptr;
+        static const bool dumping = std::getenv("NWIIU_SHADER_DUMP") != nullptr;
+        // Host time spent rendering, reported with DRAWSTATS against wall
+        // time; the remainder is guest execution and HLE.
+        const auto started = std::chrono::steady_clock::now();
+        struct Accumulate {
+            WwhdRenderer& self;
+            std::chrono::steady_clock::time_point started;
+            size_t event;
+            ~Accumulate() {
+                const auto ns = static_cast<uint64_t>(
+                    std::chrono::duration_cast<std::chrono::nanoseconds>(
+                        std::chrono::steady_clock::now() - started)
+                        .count());
+                self.render_ns_ += ns;
+                if (event < self.render_event_ns_.size()) {
+                    self.render_event_ns_[event] += ns;
+                }
+            }
+        } accumulate{self, started, static_cast<size_t>(event)};
         try {
             switch (event) {
             case Gx2Event::clear_color:
@@ -1933,10 +2359,16 @@ private:
                 break;
             }
         } catch (const std::exception& error) {
-            if (!dumping) {
+            // A title the renderer does not fully model (anything but WWHD)
+            // hits unsupported draws constantly; drop the draw and keep the
+            // game running unless NWIIU_RENDER_STRICT asks for the old abort.
+            if (!dumping && std::getenv("NWIIU_RENDER_STRICT") != nullptr) {
                 throw;
             }
-            std::fprintf(stderr, "DUMP-SKIP: %s\n", error.what());
+            static std::map<std::string, unsigned> seen;
+            if (seen[error.what()]++ < 3) {
+                std::fprintf(stderr, "RENDER-SKIP: %s\n", error.what());
+            }
         }
     }
 
@@ -1947,6 +2379,10 @@ private:
     SDL_Renderer* renderer_{};
     SDL_AudioStream* audio_{};
     std::unique_ptr<WwhdGpu> gpu_;
+    bool shared_device_{};
+    PcInput input_;
+    PcGlyphs glyphs_;
+    std::unordered_set<uint64_t> dumped_textures_;
     WwhdGpu::Texture gpu_null_texture_;
     std::map<TargetKey, WwhdGpu::Texture> gpu_targets_;
     std::map<TextureKey, WwhdGpu::Texture> gpu_textures_;
@@ -1957,6 +2393,17 @@ private:
     Target feedback_target_;
     std::set<std::string> dumped_;
     uint64_t swap_count_{};
+    struct CachedTranslation {
+        bool ok{};
+        std::string error;
+        LatteTranslation value;
+    };
+    std::unordered_map<uint64_t, CachedTranslation> translation_cache_;
+    std::map<std::string, uint64_t> draw_stats_;
+    std::vector<uint8_t> vertex_scratch_;
+    uint64_t render_ns_{};
+    std::array<double, 8> render_event_ns_{};
+    std::chrono::steady_clock::time_point stats_window_start_{};
     uint64_t scan_copies_{};
     uint64_t composite_logs_{};
     uint64_t probe_logs_{};

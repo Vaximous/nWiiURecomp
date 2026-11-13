@@ -53,6 +53,15 @@ struct LatteTranslation {
 
 uint32_t decode_latte_vertex_word(uint32_t word, uint32_t endian);
 
+// Vertex fetch formats (SQ_DATA_FORMAT): component count and element size;
+// both throw for formats the translator cannot feed.
+uint32_t latte_vertex_components(uint32_t format);
+uint32_t latte_vertex_element_size(uint32_t format);
+// One element of guest vertex data -> float bit patterns as the fetch would
+// load them into a GPR (norm/scaled converted, int passed as integer bits).
+std::array<uint32_t, 4> decode_latte_vertex_element(
+    std::span<const uint8_t> raw, const LatteVertexInput& input);
+
 // SDL_GPU SPIR-V binding conventions used by the emitted GLSL:
 //   VS uniforms:  layout(std140, set=1, binding=0) uniform VsRegs {vec4 c[256];}
 //   PS uniforms:  layout(std140, set=3, binding=0) uniform PsRegs {vec4 c[256];}

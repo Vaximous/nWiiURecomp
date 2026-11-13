@@ -684,11 +684,20 @@ inline void extsh(CPUContext& cpu, uint32_t ra, uint32_t rs, bool rc) {
 }
 
 
+// UGQR0..7 (896..903) are the user-mode aliases of GQR0..7 (912..919).
+inline bool is_gqr_spr(uint32_t spr) {
+    return (spr >= 896 && spr <= 903) || (spr >= 912 && spr <= 919);
+}
+
 inline void mfspr(CPUContext& cpu, uint32_t rt, uint32_t spr) {
     if (spr == 8) {
         cpu.gpr[rt] = cpu.lr;
     } else if (spr == 9) {
         cpu.gpr[rt] = cpu.ctr;
+    } else if (spr == 1) {
+        cpu.gpr[rt] = cpu.xer;
+    } else if (is_gqr_spr(spr)) {
+        cpu.gpr[rt] = cpu.gqr[spr & 7];
     } else {
         throw GuestFault("unsupported SPR", cpu.pc, 4, cpu.pc,
                          MemoryAccess::execute);
@@ -701,23 +710,78 @@ inline void mtspr(CPUContext& cpu, uint32_t rs, uint32_t spr) {
         cpu.lr = cpu.gpr[rs];
     } else if (spr == 9) {
         cpu.ctr = cpu.gpr[rs];
-    } else if (spr < 898 || spr > 901) {
+    } else if (spr == 1) {
+        cpu.xer = cpu.gpr[rs];
+    } else if (is_gqr_spr(spr)) {
+        cpu.gqr[spr & 7] = cpu.gpr[rs];
+    } else {
         throw GuestFault("unsupported SPR", cpu.pc, 4, cpu.pc,
                          MemoryAccess::execute);
     }
-    // Reached Espresso implementation-control writes have no user-visible
-    // effect in the unified-memory HLE runtime.
     cpu.pc += 4;
 }
 
-inline void lwz(CPUContext& cpu, GuestMemory& memory, uint32_t rt, uint32_t ra,
+inline void nand_(CPUContext& cpu, uint32_t ra, uint32_t rs, uint32_t rb,
+                  bool rc) {
+    cpu.gpr[ra] = ~(cpu.gpr[rs] & cpu.gpr[rb]);
+    if (rc) {
+        set_integer_cr(cpu, 0, cpu.gpr[ra]);
+    }
+    cpu.pc += 4;
+}
+
+inline void eqv(CPUContext& cpu, uint32_t ra, uint32_t rs, uint32_t rb,
+                bool rc) {
+    cpu.gpr[ra] = ~(cpu.gpr[rs] ^ cpu.gpr[rb]);
+    if (rc) {
+        set_integer_cr(cpu, 0, cpu.gpr[ra]);
+    }
+    cpu.pc += 4;
+}
+
+// rt = operand + CA - 1, shared by addme (operand = ra) and subfme (~ra).
+inline void add_minus_one_extended(CPUContext& cpu, uint32_t rt,
+                                   uint32_t operand, bool oe, bool rc) {
+    const bool carry_in = (cpu.xer & kXerCa) != 0;
+    const uint64_t result =
+        static_cast<uint64_t>(operand) + 0xFFFFFFFFull + carry_in;
+    cpu.gpr[rt] = static_cast<uint32_t>(result);
+    set_ca(cpu, (result >> 32) != 0);
+    if (oe) {
+        const int64_t wide =
+            static_cast<int64_t>(signed32(operand)) - 1 + carry_in;
+        set_ov(cpu, wide != static_cast<int32_t>(wide));
+    }
+    if (rc) {
+        set_integer_cr(cpu, 0, cpu.gpr[rt]);
+    }
+    cpu.pc += 4;
+}
+
+inline void addme(CPUContext& cpu, uint32_t rt, uint32_t ra, bool oe,
+                  bool rc) {
+    add_minus_one_extended(cpu, rt, cpu.gpr[ra], oe, rc);
+}
+
+inline void subfme(CPUContext& cpu, uint32_t rt, uint32_t ra, bool oe,
+                   bool rc) {
+    add_minus_one_extended(cpu, rt, ~cpu.gpr[ra], oe, rc);
+}
+
+// Memory barriers have no observable effect on the host-ordered runtime.
+inline void sync(CPUContext& cpu) { cpu.pc += 4; }
+inline void eieio(CPUContext& cpu) { cpu.pc += 4; }
+
+template <class Memory>
+inline void lwz(CPUContext& cpu, Memory& memory, uint32_t rt, uint32_t ra,
          int32_t displacement) {
     const uint32_t address = effective_address(cpu, ra, displacement);
     cpu.gpr[rt] = memory.read32(address, cpu.pc);
     cpu.pc += 4;
 }
 
-inline void lwzu(CPUContext& cpu, GuestMemory& memory, uint32_t rt, uint32_t ra,
+template <class Memory>
+inline void lwzu(CPUContext& cpu, Memory& memory, uint32_t rt, uint32_t ra,
           int32_t displacement) {
     require_update_form(cpu, rt, ra, true);
     const uint32_t address = cpu.gpr[ra] + static_cast<uint32_t>(displacement);
@@ -726,7 +790,8 @@ inline void lwzu(CPUContext& cpu, GuestMemory& memory, uint32_t rt, uint32_t ra,
     cpu.gpr[ra] = address;
     cpu.pc += 4;
 }
-inline void lhzu(CPUContext& cpu, GuestMemory& memory, uint32_t rt, uint32_t ra,
+template <class Memory>
+inline void lhzu(CPUContext& cpu, Memory& memory, uint32_t rt, uint32_t ra,
           int32_t displacement) {
     require_update_form(cpu, rt, ra, true);
     const uint32_t address = cpu.gpr[ra] + static_cast<uint32_t>(displacement);
@@ -736,14 +801,16 @@ inline void lhzu(CPUContext& cpu, GuestMemory& memory, uint32_t rt, uint32_t ra,
     cpu.pc += 4;
 }
 
-inline void lhz(CPUContext& cpu, GuestMemory& memory, uint32_t rt, uint32_t ra,
+template <class Memory>
+inline void lhz(CPUContext& cpu, Memory& memory, uint32_t rt, uint32_t ra,
          int32_t displacement) {
     const uint32_t address = effective_address(cpu, ra, displacement);
     cpu.gpr[rt] = memory.read16(address, cpu.pc);
     cpu.pc += 4;
 }
 
-inline void lha(CPUContext& cpu, GuestMemory& memory, uint32_t rt, uint32_t ra,
+template <class Memory>
+inline void lha(CPUContext& cpu, Memory& memory, uint32_t rt, uint32_t ra,
          int32_t displacement) {
     const uint32_t address = effective_address(cpu, ra, displacement);
     cpu.gpr[rt] = static_cast<uint32_t>(
@@ -751,7 +818,8 @@ inline void lha(CPUContext& cpu, GuestMemory& memory, uint32_t rt, uint32_t ra,
             memory.read16(address, cpu.pc))));
     cpu.pc += 4;
 }
-inline void lhau(CPUContext& cpu, GuestMemory& memory, uint32_t rt, uint32_t ra,
+template <class Memory>
+inline void lhau(CPUContext& cpu, Memory& memory, uint32_t rt, uint32_t ra,
           int32_t displacement) {
     require_update_form(cpu, rt, ra, true);
     const uint32_t address = cpu.gpr[ra] + static_cast<uint32_t>(displacement);
@@ -763,13 +831,15 @@ inline void lhau(CPUContext& cpu, GuestMemory& memory, uint32_t rt, uint32_t ra,
     cpu.pc += 4;
 }
 
-inline void lbz(CPUContext& cpu, GuestMemory& memory, uint32_t rt, uint32_t ra,
+template <class Memory>
+inline void lbz(CPUContext& cpu, Memory& memory, uint32_t rt, uint32_t ra,
          int32_t displacement) {
     cpu.gpr[rt] = memory.read8(effective_address(cpu, ra, displacement), cpu.pc);
     cpu.pc += 4;
 }
 
-inline void lbzu(CPUContext& cpu, GuestMemory& memory, uint32_t rt, uint32_t ra,
+template <class Memory>
+inline void lbzu(CPUContext& cpu, Memory& memory, uint32_t rt, uint32_t ra,
           int32_t displacement) {
     require_update_form(cpu, rt, ra, true);
     const uint32_t address = cpu.gpr[ra] + static_cast<uint32_t>(displacement);
@@ -779,7 +849,8 @@ inline void lbzu(CPUContext& cpu, GuestMemory& memory, uint32_t rt, uint32_t ra,
     cpu.pc += 4;
 }
 
-inline void stw(CPUContext& cpu, GuestMemory& memory, uint32_t rs, uint32_t ra,
+template <class Memory>
+inline void stw(CPUContext& cpu, Memory& memory, uint32_t rs, uint32_t ra,
          int32_t displacement) {
     const uint32_t address = effective_address(cpu, ra, displacement);
     if (std::getenv("NWIIU_MATRIX_TRACE") != nullptr &&
@@ -792,7 +863,8 @@ inline void stw(CPUContext& cpu, GuestMemory& memory, uint32_t rs, uint32_t ra,
     cpu.pc += 4;
 }
 
-inline void stwu(CPUContext& cpu, GuestMemory& memory, uint32_t rs, uint32_t ra,
+template <class Memory>
+inline void stwu(CPUContext& cpu, Memory& memory, uint32_t rs, uint32_t ra,
           int32_t displacement) {
     require_update_form(cpu, rs, ra, false);
     const uint32_t address = cpu.gpr[ra] + static_cast<uint32_t>(displacement);
@@ -802,14 +874,16 @@ inline void stwu(CPUContext& cpu, GuestMemory& memory, uint32_t rs, uint32_t ra,
     cpu.pc += 4;
 }
 
-inline void stb(CPUContext& cpu, GuestMemory& memory, uint32_t rs, uint32_t ra,
+template <class Memory>
+inline void stb(CPUContext& cpu, Memory& memory, uint32_t rs, uint32_t ra,
          int32_t displacement) {
     memory.write8(effective_address(cpu, ra, displacement),
                   static_cast<uint8_t>(cpu.gpr[rs]), cpu.pc);
     cpu.pc += 4;
 }
 
-inline void stbu(CPUContext& cpu, GuestMemory& memory, uint32_t rs, uint32_t ra,
+template <class Memory>
+inline void stbu(CPUContext& cpu, Memory& memory, uint32_t rs, uint32_t ra,
           int32_t displacement) {
     require_update_form(cpu, rs, ra, false);
     const uint32_t address = cpu.gpr[ra] + static_cast<uint32_t>(displacement);
@@ -819,13 +893,15 @@ inline void stbu(CPUContext& cpu, GuestMemory& memory, uint32_t rs, uint32_t ra,
     cpu.pc += 4;
 }
 
-inline void sth(CPUContext& cpu, GuestMemory& memory, uint32_t rs, uint32_t ra,
+template <class Memory>
+inline void sth(CPUContext& cpu, Memory& memory, uint32_t rs, uint32_t ra,
          int32_t displacement) {
     const uint32_t address = effective_address(cpu, ra, displacement);
     memory.write16(address, static_cast<uint16_t>(cpu.gpr[rs]), cpu.pc);
     cpu.pc += 4;
 }
-inline void sthu(CPUContext& cpu, GuestMemory& memory, uint32_t rs, uint32_t ra,
+template <class Memory>
+inline void sthu(CPUContext& cpu, Memory& memory, uint32_t rs, uint32_t ra,
           int32_t displacement) {
     require_update_form(cpu, rs, ra, false);
     const uint32_t address = cpu.gpr[ra] + static_cast<uint32_t>(displacement);
@@ -835,7 +911,8 @@ inline void sthu(CPUContext& cpu, GuestMemory& memory, uint32_t rs, uint32_t ra,
 }
 
 
-inline void lmw(CPUContext& cpu, GuestMemory& memory, uint32_t rt, uint32_t ra,
+template <class Memory>
+inline void lmw(CPUContext& cpu, Memory& memory, uint32_t rt, uint32_t ra,
          int32_t displacement) {
     uint32_t address = effective_address(cpu, ra, displacement);
     for (uint32_t reg = rt; reg < cpu.gpr.size(); ++reg, address += 4) {
@@ -844,7 +921,8 @@ inline void lmw(CPUContext& cpu, GuestMemory& memory, uint32_t rt, uint32_t ra,
     cpu.pc += 4;
 }
 
-inline void stmw(CPUContext& cpu, GuestMemory& memory, uint32_t rs, uint32_t ra,
+template <class Memory>
+inline void stmw(CPUContext& cpu, Memory& memory, uint32_t rs, uint32_t ra,
           int32_t displacement) {
     uint32_t address = effective_address(cpu, ra, displacement);
     for (uint32_t reg = rs; reg < cpu.gpr.size(); ++reg, address += 4) {
@@ -853,13 +931,15 @@ inline void stmw(CPUContext& cpu, GuestMemory& memory, uint32_t rs, uint32_t ra,
     cpu.pc += 4;
 }
 
-inline void lwzx(CPUContext& cpu, GuestMemory& memory, uint32_t rt, uint32_t ra,
+template <class Memory>
+inline void lwzx(CPUContext& cpu, Memory& memory, uint32_t rt, uint32_t ra,
           uint32_t rb) {
     const uint32_t address = indexed_address(cpu, ra, rb);
     cpu.gpr[rt] = memory.read32(address, cpu.pc);
     cpu.pc += 4;
 }
-inline void lwzux(CPUContext& cpu, GuestMemory& memory, uint32_t rt, uint32_t ra,
+template <class Memory>
+inline void lwzux(CPUContext& cpu, Memory& memory, uint32_t rt, uint32_t ra,
            uint32_t rb) {
     require_update_form(cpu, rt, ra, true);
     const uint32_t address = cpu.gpr[ra] + cpu.gpr[rb];
@@ -868,7 +948,8 @@ inline void lwzux(CPUContext& cpu, GuestMemory& memory, uint32_t rt, uint32_t ra
     cpu.gpr[ra] = address;
     cpu.pc += 4;
 }
-inline void lwarx(CPUContext& cpu, GuestMemory& memory, uint32_t rt, uint32_t ra,
+template <class Memory>
+inline void lwarx(CPUContext& cpu, Memory& memory, uint32_t rt, uint32_t ra,
            uint32_t rb) {
     const uint32_t address = indexed_address(cpu, ra, rb);
     require_aligned(cpu, address, 4, MemoryAccess::read);
@@ -880,14 +961,16 @@ inline void lwarx(CPUContext& cpu, GuestMemory& memory, uint32_t rt, uint32_t ra
     cpu.pc += 4;
 }
 
-inline void lwbrx(CPUContext& cpu, GuestMemory& memory, uint32_t rt, uint32_t ra,
+template <class Memory>
+inline void lwbrx(CPUContext& cpu, Memory& memory, uint32_t rt, uint32_t ra,
            uint32_t rb) {
     const uint32_t address = indexed_address(cpu, ra, rb);
     cpu.gpr[rt] = reverse_bytes(memory.read32(address, cpu.pc));
     cpu.pc += 4;
 }
 
-inline void lbzux(CPUContext& cpu, GuestMemory& memory, uint32_t rt, uint32_t ra,
+template <class Memory>
+inline void lbzux(CPUContext& cpu, Memory& memory, uint32_t rt, uint32_t ra,
            uint32_t rb) {
     require_update_form(cpu, rt, ra, true);
     const uint32_t address = cpu.gpr[ra] + cpu.gpr[rb];
@@ -897,7 +980,8 @@ inline void lbzux(CPUContext& cpu, GuestMemory& memory, uint32_t rt, uint32_t ra
     cpu.pc += 4;
 }
 
-inline void lhaux(CPUContext& cpu, GuestMemory& memory, uint32_t rt, uint32_t ra,
+template <class Memory>
+inline void lhaux(CPUContext& cpu, Memory& memory, uint32_t rt, uint32_t ra,
            uint32_t rb) {
     require_update_form(cpu, rt, ra, true);
     const uint32_t address = cpu.gpr[ra] + cpu.gpr[rb];
@@ -909,13 +993,15 @@ inline void lhaux(CPUContext& cpu, GuestMemory& memory, uint32_t rt, uint32_t ra
     cpu.pc += 4;
 }
 
-inline void lbzx(CPUContext& cpu, GuestMemory& memory, uint32_t rt, uint32_t ra,
+template <class Memory>
+inline void lbzx(CPUContext& cpu, Memory& memory, uint32_t rt, uint32_t ra,
           uint32_t rb) {
     cpu.gpr[rt] = memory.read8(indexed_address(cpu, ra, rb), cpu.pc);
     cpu.pc += 4;
 }
 
-inline void lhax(CPUContext& cpu, GuestMemory& memory, uint32_t rt, uint32_t ra,
+template <class Memory>
+inline void lhax(CPUContext& cpu, Memory& memory, uint32_t rt, uint32_t ra,
           uint32_t rb) {
     const uint32_t address = indexed_address(cpu, ra, rb);
     cpu.gpr[rt] = static_cast<uint32_t>(
@@ -923,13 +1009,15 @@ inline void lhax(CPUContext& cpu, GuestMemory& memory, uint32_t rt, uint32_t ra,
             memory.read16(address, cpu.pc))));
     cpu.pc += 4;
 }
-inline void lhzx(CPUContext& cpu, GuestMemory& memory, uint32_t rt, uint32_t ra,
+template <class Memory>
+inline void lhzx(CPUContext& cpu, Memory& memory, uint32_t rt, uint32_t ra,
           uint32_t rb) {
     const uint32_t address = indexed_address(cpu, ra, rb);
     cpu.gpr[rt] = memory.read16(address, cpu.pc);
     cpu.pc += 4;
 }
-inline void lhzux(CPUContext& cpu, GuestMemory& memory, uint32_t rt, uint32_t ra,
+template <class Memory>
+inline void lhzux(CPUContext& cpu, Memory& memory, uint32_t rt, uint32_t ra,
            uint32_t rb) {
     require_update_form(cpu, rt, ra, true);
     const uint32_t address = cpu.gpr[ra] + cpu.gpr[rb];
@@ -940,13 +1028,15 @@ inline void lhzux(CPUContext& cpu, GuestMemory& memory, uint32_t rt, uint32_t ra
 }
 
 
-inline void stwx(CPUContext& cpu, GuestMemory& memory, uint32_t rs, uint32_t ra,
+template <class Memory>
+inline void stwx(CPUContext& cpu, Memory& memory, uint32_t rs, uint32_t ra,
           uint32_t rb) {
     const uint32_t address = indexed_address(cpu, ra, rb);
     memory.write32(address, cpu.gpr[rs], cpu.pc);
     cpu.pc += 4;
 }
-inline void stwux(CPUContext& cpu, GuestMemory& memory, uint32_t rs, uint32_t ra,
+template <class Memory>
+inline void stwux(CPUContext& cpu, Memory& memory, uint32_t rs, uint32_t ra,
            uint32_t rb) {
     require_update_form(cpu, rs, ra, false);
     const uint32_t address = cpu.gpr[ra] + cpu.gpr[rb];
@@ -955,25 +1045,28 @@ inline void stwux(CPUContext& cpu, GuestMemory& memory, uint32_t rs, uint32_t ra
     cpu.gpr[ra] = address;
     cpu.pc += 4;
 }
-inline void stwcx(CPUContext& cpu, GuestMemory& memory, uint32_t rs, uint32_t ra,
+template <class Memory>
+inline void stwcx(CPUContext& cpu, Memory& memory, uint32_t rs, uint32_t ra,
            uint32_t rb) {
     const uint32_t address = indexed_address(cpu, ra, rb);
     require_aligned(cpu, address, 4, MemoryAccess::write);
     // Matches the host's reservation semantics: a conflicting write between
     // lwarx and stwcx. must break the reservation, not just a lost address.
+    // The compare and the store are one host atomic when guest memory is
+    // flat, so cores on separate host threads cannot both win a lock word.
     const bool stored = cpu.reservation_valid &&
                         cpu.reservation_address == address &&
-                        memory.read32(address, cpu.pc) == cpu.reservation_value;
-    if (stored) {
-        memory.write32(address, cpu.gpr[rs], cpu.pc);
-    }
+                        memory.compare_exchange32(address,
+                                                  cpu.reservation_value,
+                                                  cpu.gpr[rs], cpu.pc);
     cpu.reservation_valid = false;
     cpu.cr[0] = static_cast<uint8_t>((stored ? 2 : 0) |
                                      ((cpu.xer & kXerSo) != 0 ? 1 : 0));
     cpu.pc += 4;
 }
 
-inline void stwbrx(CPUContext& cpu, GuestMemory& memory, uint32_t rs, uint32_t ra,
+template <class Memory>
+inline void stwbrx(CPUContext& cpu, Memory& memory, uint32_t rs, uint32_t ra,
             uint32_t rb) {
     const uint32_t address = indexed_address(cpu, ra, rb);
     memory.write32(address, reverse_bytes(cpu.gpr[rs]), cpu.pc);
@@ -982,7 +1075,8 @@ inline void stwbrx(CPUContext& cpu, GuestMemory& memory, uint32_t rs, uint32_t r
 
 inline void dcbf(CPUContext& cpu) { cpu.pc += 4; }
 inline void dcbst(CPUContext& cpu) { cpu.pc += 4; }
-inline void dcbz(CPUContext& cpu, GuestMemory& memory, uint32_t ra, uint32_t rb) {
+template <class Memory>
+inline void dcbz(CPUContext& cpu, Memory& memory, uint32_t ra, uint32_t rb) {
     constexpr uint32_t kCacheLineSize = 32;
     const uint32_t address =
         indexed_address(cpu, ra, rb) & ~(kCacheLineSize - 1);
@@ -995,13 +1089,15 @@ inline void dcbz(CPUContext& cpu, GuestMemory& memory, uint32_t ra, uint32_t rb)
 }
 
 
-inline void stbx(CPUContext& cpu, GuestMemory& memory, uint32_t rs, uint32_t ra,
+template <class Memory>
+inline void stbx(CPUContext& cpu, Memory& memory, uint32_t rs, uint32_t ra,
           uint32_t rb) {
     memory.write8(indexed_address(cpu, ra, rb),
                   static_cast<uint8_t>(cpu.gpr[rs]), cpu.pc);
     cpu.pc += 4;
 }
-inline void stbux(CPUContext& cpu, GuestMemory& memory, uint32_t rs, uint32_t ra,
+template <class Memory>
+inline void stbux(CPUContext& cpu, Memory& memory, uint32_t rs, uint32_t ra,
            uint32_t rb) {
     require_update_form(cpu, rs, ra, false);
     const uint32_t address = cpu.gpr[ra] + cpu.gpr[rb];
@@ -1009,13 +1105,15 @@ inline void stbux(CPUContext& cpu, GuestMemory& memory, uint32_t rs, uint32_t ra
     cpu.gpr[ra] = address;
     cpu.pc += 4;
 }
-inline void sthx(CPUContext& cpu, GuestMemory& memory, uint32_t rs, uint32_t ra,
+template <class Memory>
+inline void sthx(CPUContext& cpu, Memory& memory, uint32_t rs, uint32_t ra,
           uint32_t rb) {
     const uint32_t address = indexed_address(cpu, ra, rb);
     memory.write16(address, static_cast<uint16_t>(cpu.gpr[rs]), cpu.pc);
     cpu.pc += 4;
 }
-inline void sthux(CPUContext& cpu, GuestMemory& memory, uint32_t rs, uint32_t ra,
+template <class Memory>
+inline void sthux(CPUContext& cpu, Memory& memory, uint32_t rs, uint32_t ra,
            uint32_t rb) {
     require_update_form(cpu, rs, ra, false);
     const uint32_t address = cpu.gpr[ra] + cpu.gpr[rb];
@@ -1023,7 +1121,8 @@ inline void sthux(CPUContext& cpu, GuestMemory& memory, uint32_t rs, uint32_t ra
     cpu.gpr[ra] = address;
     cpu.pc += 4;
 }
-inline void lswi(CPUContext& cpu, GuestMemory& memory, uint32_t rt, uint32_t ra,
+template <class Memory>
+inline void lswi(CPUContext& cpu, Memory& memory, uint32_t rt, uint32_t ra,
           uint32_t byte_count) {
     const uint32_t count = byte_count == 0 ? 32 : byte_count;
     const uint32_t address = ra == 0 ? 0 : cpu.gpr[ra];
@@ -1039,7 +1138,8 @@ inline void lswi(CPUContext& cpu, GuestMemory& memory, uint32_t rt, uint32_t ra,
     }
     cpu.pc += 4;
 }
-inline void stswi(CPUContext& cpu, GuestMemory& memory, uint32_t rs, uint32_t ra,
+template <class Memory>
+inline void stswi(CPUContext& cpu, Memory& memory, uint32_t rs, uint32_t ra,
            uint32_t byte_count) {
     const uint32_t count = byte_count == 0 ? 32 : byte_count;
     const uint32_t address = ra == 0 ? 0 : cpu.gpr[ra];
@@ -1056,28 +1156,32 @@ inline void stswi(CPUContext& cpu, GuestMemory& memory, uint32_t rs, uint32_t ra
 
 
 
-inline void stfiwx(CPUContext& cpu, GuestMemory& memory, uint32_t frs, uint32_t ra,
+template <class Memory>
+inline void stfiwx(CPUContext& cpu, Memory& memory, uint32_t frs, uint32_t ra,
             uint32_t rb) {
     const uint32_t address = indexed_address(cpu, ra, rb);
     memory.write32(address, static_cast<uint32_t>(cpu.fpr[frs][0]), cpu.pc);
     cpu.pc += 4;
 }
 
-inline void stfsx(CPUContext& cpu, GuestMemory& memory, uint32_t frs, uint32_t ra,
+template <class Memory>
+inline void stfsx(CPUContext& cpu, Memory& memory, uint32_t frs, uint32_t ra,
            uint32_t rb) {
     const uint32_t address = indexed_address(cpu, ra, rb);
     const float value = static_cast<float>(raw_double(cpu, frs));
     memory.write32(address, std::bit_cast<uint32_t>(value), cpu.pc);
     cpu.pc += 4;
 }
-inline void lfsx(CPUContext& cpu, GuestMemory& memory, uint32_t frt, uint32_t ra,
+template <class Memory>
+inline void lfsx(CPUContext& cpu, Memory& memory, uint32_t frt, uint32_t ra,
           uint32_t rb) {
     const uint32_t address = indexed_address(cpu, ra, rb);
     const float value = std::bit_cast<float>(memory.read32(address, cpu.pc));
     set_single(cpu, frt, static_cast<double>(value));
     cpu.pc += 4;
 }
-inline void lfsux(CPUContext& cpu, GuestMemory& memory, uint32_t frt, uint32_t ra,
+template <class Memory>
+inline void lfsux(CPUContext& cpu, Memory& memory, uint32_t frt, uint32_t ra,
            uint32_t rb) {
     require_update_form(cpu, frt, ra, false);
     const uint32_t address = cpu.gpr[ra] + cpu.gpr[rb];
@@ -1086,7 +1190,8 @@ inline void lfsux(CPUContext& cpu, GuestMemory& memory, uint32_t frt, uint32_t r
     cpu.gpr[ra] = address;
     cpu.pc += 4;
 }
-inline void stfsux(CPUContext& cpu, GuestMemory& memory, uint32_t frs, uint32_t ra,
+template <class Memory>
+inline void stfsux(CPUContext& cpu, Memory& memory, uint32_t frs, uint32_t ra,
             uint32_t rb) {
     require_update_form(cpu, frs, ra, false);
     const uint32_t address = cpu.gpr[ra] + cpu.gpr[rb];
@@ -1098,14 +1203,16 @@ inline void stfsux(CPUContext& cpu, GuestMemory& memory, uint32_t frs, uint32_t 
 
 
 
-inline void lfs(CPUContext& cpu, GuestMemory& memory, uint32_t frt, uint32_t ra,
+template <class Memory>
+inline void lfs(CPUContext& cpu, Memory& memory, uint32_t frt, uint32_t ra,
          int32_t displacement) {
     const uint32_t address = effective_address(cpu, ra, displacement);
     const float value = std::bit_cast<float>(memory.read32(address, cpu.pc));
     set_single(cpu, frt, static_cast<double>(value));
     cpu.pc += 4;
 }
-inline void lfsu(CPUContext& cpu, GuestMemory& memory, uint32_t frt, uint32_t ra,
+template <class Memory>
+inline void lfsu(CPUContext& cpu, Memory& memory, uint32_t frt, uint32_t ra,
            int32_t displacement) {
     require_update_form(cpu, frt, ra, false);
     const uint32_t address = cpu.gpr[ra] + static_cast<uint32_t>(displacement);
@@ -1116,14 +1223,16 @@ inline void lfsu(CPUContext& cpu, GuestMemory& memory, uint32_t frt, uint32_t ra
 }
 
 
-inline void lfd(CPUContext& cpu, GuestMemory& memory, uint32_t frt, uint32_t ra,
+template <class Memory>
+inline void lfd(CPUContext& cpu, Memory& memory, uint32_t frt, uint32_t ra,
          int32_t displacement) {
     const uint32_t address = effective_address(cpu, ra, displacement);
     cpu.fpr[frt][0] = memory.read64(address, cpu.pc);
     cpu.pc += 4;
 }
 
-inline void stfs(CPUContext& cpu, GuestMemory& memory, uint32_t frs, uint32_t ra,
+template <class Memory>
+inline void stfs(CPUContext& cpu, Memory& memory, uint32_t frs, uint32_t ra,
           int32_t displacement) {
     const uint32_t address = effective_address(cpu, ra, displacement);
     const float value = static_cast<float>(raw_double(cpu, frs));
@@ -1131,7 +1240,8 @@ inline void stfs(CPUContext& cpu, GuestMemory& memory, uint32_t frs, uint32_t ra
     cpu.pc += 4;
 }
 
-inline void stfsu(CPUContext& cpu, GuestMemory& memory, uint32_t frs, uint32_t ra,
+template <class Memory>
+inline void stfsu(CPUContext& cpu, Memory& memory, uint32_t frs, uint32_t ra,
            int32_t displacement) {
     require_update_form(cpu, frs, ra, false);
     const uint32_t address = cpu.gpr[ra] + static_cast<uint32_t>(displacement);
@@ -1141,16 +1251,62 @@ inline void stfsu(CPUContext& cpu, GuestMemory& memory, uint32_t frs, uint32_t r
     cpu.pc += 4;
 }
 
-inline void stfd(CPUContext& cpu, GuestMemory& memory, uint32_t frs, uint32_t ra,
+template <class Memory>
+inline void stfd(CPUContext& cpu, Memory& memory, uint32_t frs, uint32_t ra,
           int32_t displacement) {
     const uint32_t address = effective_address(cpu, ra, displacement);
     memory.write64(address, cpu.fpr[frs][0], cpu.pc);
     cpu.pc += 4;
 }
-inline void stfdu(CPUContext& cpu, GuestMemory& memory, uint32_t frs, uint32_t ra,
+template <class Memory>
+inline void stfdu(CPUContext& cpu, Memory& memory, uint32_t frs, uint32_t ra,
            int32_t displacement) {
     require_update_form(cpu, frs, ra, false);
     const uint32_t address = cpu.gpr[ra] + static_cast<uint32_t>(displacement);
+    memory.write64(address, cpu.fpr[frs][0], cpu.pc);
+    cpu.gpr[ra] = address;
+    cpu.pc += 4;
+}
+
+template <class Memory>
+inline void lfdu(CPUContext& cpu, Memory& memory, uint32_t frt,
+                 uint32_t ra, int32_t displacement) {
+    require_update_form(cpu, frt, ra, false);
+    const uint32_t address = cpu.gpr[ra] + static_cast<uint32_t>(displacement);
+    cpu.fpr[frt][0] = memory.read64(address, cpu.pc);
+    cpu.gpr[ra] = address;
+    cpu.pc += 4;
+}
+
+template <class Memory>
+inline void lfdx(CPUContext& cpu, Memory& memory, uint32_t frt,
+                 uint32_t ra, uint32_t rb) {
+    cpu.fpr[frt][0] = memory.read64(indexed_address(cpu, ra, rb), cpu.pc);
+    cpu.pc += 4;
+}
+
+template <class Memory>
+inline void lfdux(CPUContext& cpu, Memory& memory, uint32_t frt,
+                  uint32_t ra, uint32_t rb) {
+    require_update_form(cpu, frt, ra, false);
+    const uint32_t address = cpu.gpr[ra] + cpu.gpr[rb];
+    cpu.fpr[frt][0] = memory.read64(address, cpu.pc);
+    cpu.gpr[ra] = address;
+    cpu.pc += 4;
+}
+
+template <class Memory>
+inline void stfdx(CPUContext& cpu, Memory& memory, uint32_t frs,
+                  uint32_t ra, uint32_t rb) {
+    memory.write64(indexed_address(cpu, ra, rb), cpu.fpr[frs][0], cpu.pc);
+    cpu.pc += 4;
+}
+
+template <class Memory>
+inline void stfdux(CPUContext& cpu, Memory& memory, uint32_t frs,
+                   uint32_t ra, uint32_t rb) {
+    require_update_form(cpu, frs, ra, false);
+    const uint32_t address = cpu.gpr[ra] + cpu.gpr[rb];
     memory.write64(address, cpu.fpr[frs][0], cpu.pc);
     cpu.gpr[ra] = address;
     cpu.pc += 4;
@@ -1389,6 +1545,44 @@ inline void ps_neg(CPUContext& cpu, uint32_t frt, uint32_t frb) {
     cpu.pc += 4;
 }
 
+inline void ps_mr(CPUContext& cpu, uint32_t frt, uint32_t frb) {
+    cpu.fpr[frt] = cpu.fpr[frb];
+    cpu.pc += 4;
+}
+
+inline void ps_abs(CPUContext& cpu, uint32_t frt, uint32_t frb) {
+    cpu.fpr[frt][0] = cpu.fpr[frb][0] & ~(uint64_t{1} << 63);
+    cpu.fpr[frt][1] = cpu.fpr[frb][1] & ~(uint64_t{1} << 63);
+    cpu.pc += 4;
+}
+
+inline void ps_nabs(CPUContext& cpu, uint32_t frt, uint32_t frb) {
+    cpu.fpr[frt][0] = cpu.fpr[frb][0] | (uint64_t{1} << 63);
+    cpu.fpr[frt][1] = cpu.fpr[frb][1] | (uint64_t{1} << 63);
+    cpu.pc += 4;
+}
+
+inline void ps_div(CPUContext& cpu, uint32_t frt, uint32_t fra, uint32_t frb) {
+    for (uint32_t lane = 0; lane < 2; ++lane) {
+        const float result =
+            static_cast<float>(std::bit_cast<double>(cpu.fpr[fra][lane]) /
+                               std::bit_cast<double>(cpu.fpr[frb][lane]));
+        cpu.fpr[frt][lane] =
+            std::bit_cast<uint64_t>(static_cast<double>(result));
+    }
+    cpu.pc += 4;
+}
+
+inline void ps_res(CPUContext& cpu, uint32_t frt, uint32_t frb) {
+    for (uint32_t lane = 0; lane < 2; ++lane) {
+        const float result = static_cast<float>(approximate_reciprocal(
+            std::bit_cast<double>(cpu.fpr[frb][lane])));
+        cpu.fpr[frt][lane] =
+            std::bit_cast<uint64_t>(static_cast<double>(result));
+    }
+    cpu.pc += 4;
+}
+
 inline void ps_muls0(CPUContext& cpu, uint32_t frt, uint32_t fra, uint32_t frc) {
     const float scalar =
         static_cast<float>(std::bit_cast<double>(cpu.fpr[frc][0]));
@@ -1585,55 +1779,68 @@ inline void ps_nmadd(CPUContext& cpu, uint32_t frt, uint32_t fra, uint32_t frc,
     cpu.pc += 4;
 }
 
-static uint32_t psq_width(const CPUContext& cpu, uint32_t gqr,
-                          MemoryAccess access) {
-    if (gqr == 0) {
+// GQR layout: bits 0-2 ST_TYPE, 8-13 ST_SCALE, 16-18 LD_TYPE, 24-29 LD_SCALE.
+// Types 4/5/6/7 are U8/U16/S8/S16; every other type moves raw singles.
+// Scales are 6-bit two's complement powers of two (Dolphin/Cemu semantics).
+inline uint32_t psq_type_width(uint32_t type) {
+    switch (type) {
+    case 4:
+    case 6:
+        return 1;
+    case 5:
+    case 7:
+        return 2;
+    default:
         return 4;
     }
-    if (gqr == 2 || gqr == 4) {
-        return 1;
-    }
-    if (gqr == 3 || gqr == 5) {
-        return 2;
-    }
-    throw GuestFault("unsupported paired-single GQR index", cpu.pc, 4, cpu.pc,
-                     access);
 }
 
-static double psq_read(const CPUContext& cpu, GuestMemory& memory,
-                       uint32_t address, uint32_t gqr) {
-    if (gqr == 0) {
+inline double psq_scale_factor(uint32_t scale_field) {
+    const int32_t scale = static_cast<int32_t>(scale_field & 0x3F) >= 32
+                              ? static_cast<int32_t>(scale_field & 0x3F) - 64
+                              : static_cast<int32_t>(scale_field & 0x3F);
+    return std::ldexp(1.0, scale);
+}
+
+template <class Memory>
+inline double psq_read(const CPUContext& cpu, Memory& memory,
+                       uint32_t address, uint32_t gqr_value) {
+    const uint32_t type = (gqr_value >> 16) & 7;
+    const double dequantize = 1.0 / psq_scale_factor(gqr_value >> 24);
+    switch (type) {
+    case 4:
+        return memory.read8(address, cpu.pc) * dequantize;
+    case 5:
+        return memory.read16(address, cpu.pc) * dequantize;
+    case 6:
+        return static_cast<int8_t>(memory.read8(address, cpu.pc)) * dequantize;
+    case 7:
+        return static_cast<int16_t>(memory.read16(address, cpu.pc)) *
+               dequantize;
+    default:
         return static_cast<double>(
             std::bit_cast<float>(memory.read32(address, cpu.pc)));
     }
-    if (gqr == 2) {
-        return memory.read8(address, cpu.pc);
-    }
-    if (gqr == 3) {
-        return memory.read16(address, cpu.pc);
-    }
-    if (gqr == 4) {
-        return static_cast<int8_t>(memory.read8(address, cpu.pc));
-    }
-    return static_cast<int16_t>(memory.read16(address, cpu.pc));
 }
 
-static void psq_write(const CPUContext& cpu, GuestMemory& memory,
-                      uint32_t address, uint32_t gqr, double value) {
-    if (gqr == 0) {
+template <class Memory>
+inline void psq_write(const CPUContext& cpu, Memory& memory,
+                      uint32_t address, uint32_t gqr_value, double value) {
+    const uint32_t type = gqr_value & 7;
+    if (psq_type_width(type) == 4) {
         const float converted = static_cast<float>(value);
         memory.write32(address, std::bit_cast<uint32_t>(converted), cpu.pc);
         return;
     }
-    value = static_cast<float>(value);
+    value = static_cast<float>(value) * psq_scale_factor(gqr_value >> 8);
     value = std::isnan(value) ? 0.0 : std::trunc(value);
-    if (gqr == 2) {
+    if (type == 4) {
         memory.write8(address, static_cast<uint8_t>(
                                    std::clamp(value, 0.0, 255.0)), cpu.pc);
-    } else if (gqr == 3) {
+    } else if (type == 5) {
         memory.write16(address, static_cast<uint16_t>(
                                     std::clamp(value, 0.0, 65535.0)), cpu.pc);
-    } else if (gqr == 4) {
+    } else if (type == 6) {
         const auto converted = static_cast<int8_t>(
             std::clamp(value, -128.0, 127.0));
         memory.write8(address, static_cast<uint8_t>(converted), cpu.pc);
@@ -1644,21 +1851,45 @@ static void psq_write(const CPUContext& cpu, GuestMemory& memory,
     }
 }
 
-inline void psq_l(CPUContext& cpu, GuestMemory& memory, uint32_t frt, uint32_t ra,
-           bool w, uint32_t gqr, int32_t displacement) {
-    // Cafe OS fixes GQR2..5 to U8/U16/S8/S16 with scale zero.
-    const uint32_t width = psq_width(cpu, gqr, MemoryAccess::read);
-    const uint32_t address = effective_address(cpu, ra, displacement);
+template <class Memory>
+inline void psq_load_at(CPUContext& cpu, Memory& memory, uint32_t frt,
+                        uint32_t address, bool w, uint32_t gqr) {
+    const uint32_t gqr_value = cpu.gqr[gqr & 7];
+    const uint32_t width = psq_type_width((gqr_value >> 16) & 7);
     memory.validate_range(address, width * (w ? 1 : 2), cpu.pc,
                           MemoryAccess::read);
-    const double ps0 = psq_read(cpu, memory, address, gqr);
-    const double ps1 = w ? 1.0 : psq_read(cpu, memory, address + width, gqr);
+    const double ps0 = psq_read(cpu, memory, address, gqr_value);
+    const double ps1 =
+        w ? 1.0 : psq_read(cpu, memory, address + width, gqr_value);
     cpu.fpr[frt][0] = std::bit_cast<uint64_t>(ps0);
     cpu.fpr[frt][1] = std::bit_cast<uint64_t>(ps1);
+}
+
+template <class Memory>
+inline void psq_store_at(CPUContext& cpu, Memory& memory, uint32_t frs,
+                         uint32_t address, bool w, uint32_t gqr) {
+    const uint32_t gqr_value = cpu.gqr[gqr & 7];
+    const uint32_t width = psq_type_width(gqr_value & 7);
+    memory.validate_range(address, width * (w ? 1 : 2), cpu.pc,
+                          MemoryAccess::write);
+    psq_write(cpu, memory, address, gqr_value,
+              std::bit_cast<double>(cpu.fpr[frs][0]));
+    if (!w) {
+        psq_write(cpu, memory, address + width, gqr_value,
+                  std::bit_cast<double>(cpu.fpr[frs][1]));
+    }
+}
+
+template <class Memory>
+inline void psq_l(CPUContext& cpu, Memory& memory, uint32_t frt, uint32_t ra,
+           bool w, uint32_t gqr, int32_t displacement) {
+    psq_load_at(cpu, memory, frt, effective_address(cpu, ra, displacement), w,
+                gqr);
     cpu.pc += 4;
 }
 
-inline void psq_lu(CPUContext& cpu, GuestMemory& memory, uint32_t frt, uint32_t ra,
+template <class Memory>
+inline void psq_lu(CPUContext& cpu, Memory& memory, uint32_t frt, uint32_t ra,
             bool w, uint32_t gqr, int32_t displacement) {
     if (ra == 0) {
         throw GuestFault("reserved update form", cpu.pc, 4, cpu.pc,
@@ -1666,25 +1897,21 @@ inline void psq_lu(CPUContext& cpu, GuestMemory& memory, uint32_t frt, uint32_t 
     }
     const uint32_t address =
         cpu.gpr[ra] + static_cast<uint32_t>(displacement);
-    psq_l(cpu, memory, frt, ra, w, gqr, displacement);
+    psq_load_at(cpu, memory, frt, address, w, gqr);
     cpu.gpr[ra] = address;
-}
-
-inline void psq_st(CPUContext& cpu, GuestMemory& memory, uint32_t frs, uint32_t ra,
-            bool w, uint32_t gqr, int32_t displacement) {
-    const uint32_t width = psq_width(cpu, gqr, MemoryAccess::write);
-    const uint32_t address = effective_address(cpu, ra, displacement);
-    memory.validate_range(address, width * (w ? 1 : 2), cpu.pc,
-                          MemoryAccess::write);
-    psq_write(cpu, memory, address, gqr,
-              std::bit_cast<double>(cpu.fpr[frs][0]));
-    if (!w) {
-        psq_write(cpu, memory, address + width, gqr,
-                  std::bit_cast<double>(cpu.fpr[frs][1]));
-    }
     cpu.pc += 4;
 }
-inline void psq_stu(CPUContext& cpu, GuestMemory& memory, uint32_t frs, uint32_t ra,
+
+template <class Memory>
+inline void psq_st(CPUContext& cpu, Memory& memory, uint32_t frs, uint32_t ra,
+            bool w, uint32_t gqr, int32_t displacement) {
+    psq_store_at(cpu, memory, frs, effective_address(cpu, ra, displacement), w,
+                 gqr);
+    cpu.pc += 4;
+}
+
+template <class Memory>
+inline void psq_stu(CPUContext& cpu, Memory& memory, uint32_t frs, uint32_t ra,
              bool w, uint32_t gqr, int32_t displacement) {
     if (ra == 0) {
         throw GuestFault("reserved update form", cpu.pc, 4, cpu.pc,
@@ -1692,11 +1919,48 @@ inline void psq_stu(CPUContext& cpu, GuestMemory& memory, uint32_t frs, uint32_t
     }
     const uint32_t address =
         cpu.gpr[ra] + static_cast<uint32_t>(displacement);
-    psq_st(cpu, memory, frs, ra, w, gqr, displacement);
+    psq_store_at(cpu, memory, frs, address, w, gqr);
     cpu.gpr[ra] = address;
+    cpu.pc += 4;
 }
 
-inline uint32_t relocated_branch_target(const GuestMemory& memory, uint32_t address,
+// Indexed forms (opcode 4): W is bit 21, I is bits 22-24 of the raw word.
+template <class Memory>
+inline void psq_lx(CPUContext& cpu, Memory& memory, uint32_t frt,
+                   uint32_t ra, uint32_t rb, bool w, uint32_t gqr) {
+    psq_load_at(cpu, memory, frt, indexed_address(cpu, ra, rb), w, gqr);
+    cpu.pc += 4;
+}
+
+template <class Memory>
+inline void psq_lux(CPUContext& cpu, Memory& memory, uint32_t frt,
+                    uint32_t ra, uint32_t rb, bool w, uint32_t gqr) {
+    require_update_form(cpu, frt, ra, false);
+    const uint32_t address = cpu.gpr[ra] + cpu.gpr[rb];
+    psq_load_at(cpu, memory, frt, address, w, gqr);
+    cpu.gpr[ra] = address;
+    cpu.pc += 4;
+}
+
+template <class Memory>
+inline void psq_stx(CPUContext& cpu, Memory& memory, uint32_t frs,
+                    uint32_t ra, uint32_t rb, bool w, uint32_t gqr) {
+    psq_store_at(cpu, memory, frs, indexed_address(cpu, ra, rb), w, gqr);
+    cpu.pc += 4;
+}
+
+template <class Memory>
+inline void psq_stux(CPUContext& cpu, Memory& memory, uint32_t frs,
+                     uint32_t ra, uint32_t rb, bool w, uint32_t gqr) {
+    require_update_form(cpu, frs, ra, false);
+    const uint32_t address = cpu.gpr[ra] + cpu.gpr[rb];
+    psq_store_at(cpu, memory, frs, address, w, gqr);
+    cpu.gpr[ra] = address;
+    cpu.pc += 4;
+}
+
+template <class Memory>
+inline uint32_t relocated_branch_target(const Memory& memory, uint32_t address,
                                  uint32_t original, uint32_t fallback) {
     const uint32_t current = memory.read32(address, address);
     if (current == original) {

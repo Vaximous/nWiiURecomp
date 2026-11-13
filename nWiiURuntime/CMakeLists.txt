@@ -6,14 +6,16 @@ add_library(nwiiu_runtime STATIC src/memory.cpp src/execution_image.cpp
                                   src/cafe_runtime.cpp src/cafe_proc_ui.cpp
                                   src/gx2_runtime.cpp
                                   src/latte_surface.cpp src/latte_shader.cpp
-                                  src/cafe_coreinit.cpp
+                                  src/cafe_coreinit.cpp src/cafe_coreinit_extra.cpp
+                                  src/cafe_stubs.cpp
                                   src/cafe_filesystem.cpp src/cafe_olv.cpp
                                   src/cafe_padscore.cpp src/cafe_act.cpp
                                   src/machine.cpp src/native_hooks.cpp
-                                  src/patch_guard.cpp)
+                                  src/patch_guard.cpp src/host_sync.cpp)
 set_target_properties(nwiiu_runtime PROPERTIES POSITION_INDEPENDENT_CODE ON)
 target_include_directories(nwiiu_runtime PUBLIC include)
-target_link_libraries(nwiiu_runtime PUBLIC nwiiu_analyzer PkgConfig::SHADERC)
+find_package(ZLIB REQUIRED)
+target_link_libraries(nwiiu_runtime PUBLIC nwiiu_analyzer PkgConfig::SHADERC ZLIB::ZLIB)
 target_compile_options(nwiiu_runtime PRIVATE
     $<$<CXX_COMPILER_ID:GNU,Clang>:-Wall;-Wextra;-Wpedantic;-Werror>)
 

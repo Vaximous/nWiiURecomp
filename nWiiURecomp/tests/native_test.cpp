@@ -1398,6 +1398,27 @@ void test_startup_surface_generation() {
         Case{uint32_t{0xF5850004}, "::psq_stu(", false},
         Case{uint32_t{0x7C04E3A6}, "::mtspr(", false},
         Case{uint32_t{0x7C05E3A6}, "::mtspr(", false},
+        // Forms first reached by Devil's Third (WUP-P-ADNE).
+        Case{uint32_t{0xED01E024}, "::fdivs(", false},
+        Case{uint32_t{0x7C0004AC}, "::sync(", false},
+        Case{uint32_t{0x7C0006AC}, "::eieio(", false},
+        Case{x_form(31, 3, 4, 5, 599), "::lfdx(", false},
+        Case{x_form(31, 3, 4, 5, 631), "::lfdux(", false},
+        Case{x_form(31, 3, 4, 5, 727), "::stfdx(", false},
+        Case{x_form(31, 3, 4, 5, 759), "::stfdux(", false},
+        Case{uint32_t{0xCC230008}, "::lfdu(", false},
+        Case{x_form(31, 3, 4, 5, 476), "::nand_(", false},
+        Case{x_form(31, 3, 4, 5, 284), "::eqv(", false},
+        Case{x_form(31, 3, 4, 0, 234), "::addme(", false},
+        Case{x_form(31, 3, 4, 0, 232), "::subfme(", false},
+        Case{spr_form(3, 903, 339), "::mfspr(", false},
+        Case{spr_form(3, 903, 467), "::mtspr(", false},
+        Case{uint32_t{0x10A02090}, "::ps_mr(", false},
+        Case{uint32_t{0x10A02210}, "::ps_abs(", false},
+        Case{uint32_t{0x10A02030}, "::ps_res(", false},
+        Case{uint32_t{0x1316B824}, "::ps_div(", false},
+        Case{uint32_t{0x10A3238C}, "::psq_lx(", false},
+        Case{uint32_t{0xE0E77000}, "::psq_l(", false},
     };
 
     for (const auto& test_case : cases) {
@@ -1433,10 +1454,10 @@ void test_startup_surface_generation() {
     require_rejected(
         [] {
             generate_native_block(
-                "mfspr_898_reserved", kProgramAddress,
-                std::array<uint32_t, 1>{spr_form(3, 898, 339)}, {});
+                "mfspr_hid0_reserved", kProgramAddress,
+                std::array<uint32_t, 1>{spr_form(3, 1008, 339)}, {});
         },
-        "mfspr 898 remains unsupported");
+        "mfspr HID0 remains unsupported");
     require_rejected(
         [] {
             generate_native_block(

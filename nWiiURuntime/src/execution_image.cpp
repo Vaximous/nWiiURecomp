@@ -1,14 +1,57 @@
 #include "runtime/execution_image.h"
+#include "runtime/rpx_exports.h"
 
 #include "nwiiu/analyzer/ppc_instruction.h"
 
+#include <map>
 #include <set>
+#include <string>
 #include <stdexcept>
 
 namespace nwii::runtime {
 namespace {
 constexpr uint32_t kStackTop = 0x50000000;
 constexpr uint32_t kPageSize = 0x1000;
+
+std::map<std::string, uint32_t, std::less<>>& function_exports() {
+    static std::map<std::string, uint32_t, std::less<>> exports;
+    return exports;
+}
+
+uint32_t be32(const std::vector<uint8_t>& data, size_t offset) {
+    return (uint32_t{data[offset]} << 24) | (uint32_t{data[offset + 1]} << 16) |
+           (uint32_t{data[offset + 2]} << 8) | data[offset + 3];
+}
+
+// SHT_RPL_EXPORTS: be32 count, be32 signature, count x {be32 value,
+// be32 name offset (bit 31 = TLS)}, then NUL-terminated names; offsets are
+// relative to the section start.
+void collect_function_exports(const nwiiu::analyzer::RpxImage& rpx) {
+    auto& exports = function_exports();
+    exports.clear();
+    for (const auto& section : rpx.sections) {
+        if (section.type != nwiiu::analyzer::kShtRplExports ||
+            (section.flags & nwiiu::analyzer::kShfExec) == 0 ||
+            section.data.size() < 8) {
+            continue;
+        }
+        const auto& data = section.data;
+        const uint32_t count = be32(data, 0);
+        for (uint32_t index = 0; index < count; ++index) {
+            const size_t entry = 8 + size_t{index} * 8;
+            if (entry + 8 > data.size()) {
+                break;
+            }
+            const uint32_t value = be32(data, entry);
+            const size_t name = be32(data, entry + 4) & 0x7FFFFFFFu;
+            std::string text;
+            for (size_t at = name; at < data.size() && data[at] != 0; ++at) {
+                text.push_back(static_cast<char>(data[at]));
+            }
+            exports.insert_or_assign(std::move(text), value);
+        }
+    }
+}
 
 bool is_mapped_section(const nwiiu::analyzer::Section& section) {
     return (section.flags & nwiiu::analyzer::kShfAlloc) != 0 &&
@@ -31,6 +74,7 @@ ExecutionImage make_execution_image(const nwiiu::analyzer::RpxImage& rpx) {
     }
 
     ExecutionImage image;
+    collect_function_exports(rpx);
     image.entry_point = rpx.entry_point;
     image.stack_base = kStackTop - file_info.core_stack_size;
     image.stack_top = kStackTop;
@@ -46,6 +90,13 @@ ExecutionImage make_execution_image(const nwiiu::analyzer::RpxImage& rpx) {
             section.type == nwiiu::analyzer::kShtRplImports ||
                 (section.flags & nwiiu::analyzer::kShfWrite) != 0,
             (section.flags & nwiiu::analyzer::kShfExec) != 0};
+        if (section.address >= 0x10000000 && section.address < kStackTop) {
+            const uint64_t end = static_cast<uint64_t>(section.address) +
+                                 section.decompressed_size;
+            if (end > image.data_end) {
+                image.data_end = static_cast<uint32_t>(end);
+            }
+        }
         if (section.type == nwiiu::analyzer::kShtProgbits) {
             if (section.data.size() != section.decompressed_size) {
                 throw std::runtime_error(
@@ -83,6 +134,13 @@ ExecutionImage make_execution_image(const nwiiu::analyzer::RpxImage& rpx) {
         }
         const auto& source_section =
             rpx.sections[relocation.source_section_index];
+        // Titles that export symbols (e.g. Devil's Third) carry relocations
+        // into their SHT_RPL_EXPORTS table. That table is loader metadata
+        // living at a virtual 0xC0000000 address, never guest-mapped memory,
+        // so its fix-ups have nothing to patch here.
+        if (source_section.type == nwiiu::analyzer::kShtRplExports) {
+            continue;
+        }
         if (!is_mapped_section(source_section)) {
             throw std::runtime_error("ineligible relocation source section");
         }
@@ -178,6 +236,12 @@ ExecutionImage make_execution_image(const nwiiu::analyzer::RpxImage& rpx) {
         }
     }
     return image;
+}
+
+uint32_t rpx_export_address(std::string_view name) {
+    const auto& exports = function_exports();
+    const auto found = exports.find(name);
+    return found == exports.end() ? 0 : found->second;
 }
 
 void initialize_cpu(const ExecutionImage& image, CPUContext& cpu) {

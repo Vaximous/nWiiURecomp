@@ -3,6 +3,7 @@
 #include <array>
 #include <cstdint>
 #include <cstring>
+#include <memory>
 #include <span>
 #include <stdexcept>
 #include <string>
@@ -65,6 +66,36 @@ public:
              std::span<const uint8_t> initial = {});
     uint64_t mapped_bytes() const;
     uint64_t resident_bytes() const;
+    // Moves an internally backed memory onto one reserved 4 GiB host range:
+    // every existing mapping is committed and its pages copied over, later
+    // maps commit in place, and the inline flat fast paths take over. That
+    // makes concurrent access from several host threads safe (no lazily
+    // grown page table) and lets stwcx. use a real host compare-exchange.
+    // Accesses outside a mapping no longer raise GuestFault. Returns false
+    // when the host could not reserve the range (memory stays paged).
+    bool enable_host_flat();
+    bool host_flat() const { return flat_owner_ != nullptr; }
+    // Base of the host-flat range (null unless host_flat() or a full-range
+    // callback mapping was adopted).
+    uint8_t* flat_data() { return mutable_flat(); }
+    // Atomic when flat: stores `desired` only if the word still equals
+    // `expected`. Used by stwcx. so reservations hold across host threads.
+    bool compare_exchange32(uint32_t address, uint32_t expected,
+                            uint32_t desired, uint32_t pc) {
+        if (flat_base_ != nullptr) {
+            uint32_t raw_expected = NWII_BSWAP32(expected);
+            const uint32_t raw_desired = NWII_BSWAP32(desired);
+            return __atomic_compare_exchange_n(
+                reinterpret_cast<uint32_t*>(mutable_flat() + address),
+                &raw_expected, raw_desired, false, __ATOMIC_SEQ_CST,
+                __ATOMIC_SEQ_CST);
+        }
+        if (read32(address, pc) != expected) {
+            return false;
+        }
+        write32(address, desired, pc);
+        return true;
+    }
     // Hot paths are inline: the module is built without LTO, so an
     // out-of-line call here would defeat the point of the flat mapping.
     uint8_t read8(uint32_t address, uint32_t pc) const {
@@ -172,7 +203,64 @@ private:
 
     GuestMemoryCallbacks callbacks_{};
     const uint8_t* flat_base_{};
+    // Owns the host reservation behind enable_host_flat(); shared so that a
+    // copied GuestMemory never frees the range under the original.
+    std::shared_ptr<uint8_t> flat_owner_;
     std::vector<Mapping> mappings_;
     std::unordered_map<uint32_t, Page> pages_;
+};
+
+// What recompiled blocks access guest memory through: the host-flat range as
+// plain big-endian loads and stores, with no paged fallback and no mapping or
+// permission checks. The instruction semantics are templates over the memory
+// type, so these instantiations never collide with the interpreter's
+// GuestMemory ones. Only valid once GuestMemory::enable_host_flat succeeded
+// (the registry refuses to install blocks otherwise).
+class FlatMemory {
+public:
+    explicit FlatMemory(GuestMemory& memory) : base_(memory.flat_data()) {}
+    uint8_t read8(uint32_t address, uint32_t) const { return base_[address]; }
+    uint16_t read16(uint32_t address, uint32_t) const {
+        uint16_t raw;
+        std::memcpy(&raw, base_ + address, sizeof raw);
+        return NWII_BSWAP16(raw);
+    }
+    uint32_t read32(uint32_t address, uint32_t) const {
+        uint32_t raw;
+        std::memcpy(&raw, base_ + address, sizeof raw);
+        return NWII_BSWAP32(raw);
+    }
+    uint64_t read64(uint32_t address, uint32_t) const {
+        uint64_t raw;
+        std::memcpy(&raw, base_ + address, sizeof raw);
+        return NWII_BSWAP64(raw);
+    }
+    void write8(uint32_t address, uint8_t value, uint32_t) {
+        base_[address] = value;
+    }
+    void write16(uint32_t address, uint16_t value, uint32_t) {
+        const uint16_t raw = NWII_BSWAP16(value);
+        std::memcpy(base_ + address, &raw, sizeof raw);
+    }
+    void write32(uint32_t address, uint32_t value, uint32_t) {
+        const uint32_t raw = NWII_BSWAP32(value);
+        std::memcpy(base_ + address, &raw, sizeof raw);
+    }
+    void write64(uint32_t address, uint64_t value, uint32_t) {
+        const uint64_t raw = NWII_BSWAP64(value);
+        std::memcpy(base_ + address, &raw, sizeof raw);
+    }
+    bool compare_exchange32(uint32_t address, uint32_t expected,
+                            uint32_t desired, uint32_t) {
+        uint32_t raw_expected = NWII_BSWAP32(expected);
+        return __atomic_compare_exchange_n(
+            reinterpret_cast<uint32_t*>(base_ + address), &raw_expected,
+            NWII_BSWAP32(desired), false, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST);
+    }
+    void validate(uint32_t, uint32_t, uint32_t, MemoryAccess) const {}
+    void validate_range(uint32_t, uint32_t, uint32_t, MemoryAccess) const {}
+
+private:
+    uint8_t* base_;
 };
 }

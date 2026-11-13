@@ -82,109 +82,160 @@ void extsh(CPUContext& cpu, uint32_t ra, uint32_t rs, bool rc);
 void mfspr(CPUContext& cpu, uint32_t rt, uint32_t spr);
 void mtspr(CPUContext& cpu, uint32_t rs, uint32_t spr);
 
-void lwz(CPUContext& cpu, GuestMemory& memory, uint32_t rt, uint32_t ra,
+template <class Memory>
+void lwz(CPUContext& cpu, Memory& memory, uint32_t rt, uint32_t ra,
          int32_t displacement);
-void lwzu(CPUContext& cpu, GuestMemory& memory, uint32_t rt, uint32_t ra,
+template <class Memory>
+void lwzu(CPUContext& cpu, Memory& memory, uint32_t rt, uint32_t ra,
           int32_t displacement);
-void lhzu(CPUContext& cpu, GuestMemory& memory, uint32_t rt, uint32_t ra,
+template <class Memory>
+void lhzu(CPUContext& cpu, Memory& memory, uint32_t rt, uint32_t ra,
           int32_t displacement);
-void lhz(CPUContext& cpu, GuestMemory& memory, uint32_t rt, uint32_t ra,
+template <class Memory>
+void lhz(CPUContext& cpu, Memory& memory, uint32_t rt, uint32_t ra,
          int32_t displacement);
-void lha(CPUContext& cpu, GuestMemory& memory, uint32_t rt, uint32_t ra,
+template <class Memory>
+void lha(CPUContext& cpu, Memory& memory, uint32_t rt, uint32_t ra,
          int32_t displacement);
-void lhau(CPUContext& cpu, GuestMemory& memory, uint32_t rt, uint32_t ra,
+template <class Memory>
+void lhau(CPUContext& cpu, Memory& memory, uint32_t rt, uint32_t ra,
           int32_t displacement);
-void lbz(CPUContext& cpu, GuestMemory& memory, uint32_t rt, uint32_t ra,
+template <class Memory>
+void lbz(CPUContext& cpu, Memory& memory, uint32_t rt, uint32_t ra,
          int32_t displacement);
-void lbzu(CPUContext& cpu, GuestMemory& memory, uint32_t rt, uint32_t ra,
+template <class Memory>
+void lbzu(CPUContext& cpu, Memory& memory, uint32_t rt, uint32_t ra,
           int32_t displacement);
-void stw(CPUContext& cpu, GuestMemory& memory, uint32_t rs, uint32_t ra,
+template <class Memory>
+void stw(CPUContext& cpu, Memory& memory, uint32_t rs, uint32_t ra,
          int32_t displacement);
-void stwu(CPUContext& cpu, GuestMemory& memory, uint32_t rs, uint32_t ra,
+template <class Memory>
+void stwu(CPUContext& cpu, Memory& memory, uint32_t rs, uint32_t ra,
           int32_t displacement);
-void stb(CPUContext& cpu, GuestMemory& memory, uint32_t rs, uint32_t ra,
+template <class Memory>
+void stb(CPUContext& cpu, Memory& memory, uint32_t rs, uint32_t ra,
          int32_t displacement);
-void stbu(CPUContext& cpu, GuestMemory& memory, uint32_t rs, uint32_t ra,
+template <class Memory>
+void stbu(CPUContext& cpu, Memory& memory, uint32_t rs, uint32_t ra,
           int32_t displacement);
-void sth(CPUContext& cpu, GuestMemory& memory, uint32_t rs, uint32_t ra,
+template <class Memory>
+void sth(CPUContext& cpu, Memory& memory, uint32_t rs, uint32_t ra,
          int32_t displacement);
-void sthu(CPUContext& cpu, GuestMemory& memory, uint32_t rs, uint32_t ra,
+template <class Memory>
+void sthu(CPUContext& cpu, Memory& memory, uint32_t rs, uint32_t ra,
           int32_t displacement);
-void lmw(CPUContext& cpu, GuestMemory& memory, uint32_t rt, uint32_t ra,
+template <class Memory>
+void lmw(CPUContext& cpu, Memory& memory, uint32_t rt, uint32_t ra,
          int32_t displacement);
-void stmw(CPUContext& cpu, GuestMemory& memory, uint32_t rs, uint32_t ra,
+template <class Memory>
+void stmw(CPUContext& cpu, Memory& memory, uint32_t rs, uint32_t ra,
           int32_t displacement);
-void lwzx(CPUContext& cpu, GuestMemory& memory, uint32_t rt, uint32_t ra,
+template <class Memory>
+void lwzx(CPUContext& cpu, Memory& memory, uint32_t rt, uint32_t ra,
           uint32_t rb);
-void lwzux(CPUContext& cpu, GuestMemory& memory, uint32_t rt, uint32_t ra,
+template <class Memory>
+void lwzux(CPUContext& cpu, Memory& memory, uint32_t rt, uint32_t ra,
            uint32_t rb);
-void lwarx(CPUContext& cpu, GuestMemory& memory, uint32_t rt, uint32_t ra,
+template <class Memory>
+void lwarx(CPUContext& cpu, Memory& memory, uint32_t rt, uint32_t ra,
            uint32_t rb);
-void lwbrx(CPUContext& cpu, GuestMemory& memory, uint32_t rt, uint32_t ra,
+template <class Memory>
+void lwbrx(CPUContext& cpu, Memory& memory, uint32_t rt, uint32_t ra,
            uint32_t rb);
-void lbzux(CPUContext& cpu, GuestMemory& memory, uint32_t rt, uint32_t ra,
+template <class Memory>
+void lbzux(CPUContext& cpu, Memory& memory, uint32_t rt, uint32_t ra,
            uint32_t rb);
-void lhaux(CPUContext& cpu, GuestMemory& memory, uint32_t rt, uint32_t ra,
+template <class Memory>
+void lhaux(CPUContext& cpu, Memory& memory, uint32_t rt, uint32_t ra,
            uint32_t rb);
-void lbzx(CPUContext& cpu, GuestMemory& memory, uint32_t rt, uint32_t ra,
+template <class Memory>
+void lbzx(CPUContext& cpu, Memory& memory, uint32_t rt, uint32_t ra,
           uint32_t rb);
-void lhax(CPUContext& cpu, GuestMemory& memory, uint32_t rt, uint32_t ra,
+template <class Memory>
+void lhax(CPUContext& cpu, Memory& memory, uint32_t rt, uint32_t ra,
           uint32_t rb);
-void lhzx(CPUContext& cpu, GuestMemory& memory, uint32_t rt, uint32_t ra,
+template <class Memory>
+void lhzx(CPUContext& cpu, Memory& memory, uint32_t rt, uint32_t ra,
           uint32_t rb);
-void lhzux(CPUContext& cpu, GuestMemory& memory, uint32_t rt, uint32_t ra,
+template <class Memory>
+void lhzux(CPUContext& cpu, Memory& memory, uint32_t rt, uint32_t ra,
            uint32_t rb);
-void stwx(CPUContext& cpu, GuestMemory& memory, uint32_t rs, uint32_t ra,
+template <class Memory>
+void stwx(CPUContext& cpu, Memory& memory, uint32_t rs, uint32_t ra,
           uint32_t rb);
-void stwux(CPUContext& cpu, GuestMemory& memory, uint32_t rs, uint32_t ra,
+template <class Memory>
+void stwux(CPUContext& cpu, Memory& memory, uint32_t rs, uint32_t ra,
            uint32_t rb);
-void stwcx(CPUContext& cpu, GuestMemory& memory, uint32_t rs, uint32_t ra,
+template <class Memory>
+void stwcx(CPUContext& cpu, Memory& memory, uint32_t rs, uint32_t ra,
            uint32_t rb);
-void stwbrx(CPUContext& cpu, GuestMemory& memory, uint32_t rs, uint32_t ra,
+template <class Memory>
+void stwbrx(CPUContext& cpu, Memory& memory, uint32_t rs, uint32_t ra,
             uint32_t rb);
-void stbux(CPUContext& cpu, GuestMemory& memory, uint32_t rs, uint32_t ra,
+template <class Memory>
+void stbux(CPUContext& cpu, Memory& memory, uint32_t rs, uint32_t ra,
            uint32_t rb);
-void sthux(CPUContext& cpu, GuestMemory& memory, uint32_t rs, uint32_t ra,
+template <class Memory>
+void sthux(CPUContext& cpu, Memory& memory, uint32_t rs, uint32_t ra,
            uint32_t rb);
 void dcbf(CPUContext& cpu);
 void dcbst(CPUContext& cpu);
-void dcbz(CPUContext& cpu, GuestMemory& memory, uint32_t ra, uint32_t rb);
-void stbx(CPUContext& cpu, GuestMemory& memory, uint32_t rs, uint32_t ra,
+template <class Memory>
+void dcbz(CPUContext& cpu, Memory& memory, uint32_t ra, uint32_t rb);
+template <class Memory>
+void stbx(CPUContext& cpu, Memory& memory, uint32_t rs, uint32_t ra,
           uint32_t rb);
-void sthx(CPUContext& cpu, GuestMemory& memory, uint32_t rs, uint32_t ra,
+template <class Memory>
+void sthx(CPUContext& cpu, Memory& memory, uint32_t rs, uint32_t ra,
           uint32_t rb);
-void lswi(CPUContext& cpu, GuestMemory& memory, uint32_t rt, uint32_t ra,
+template <class Memory>
+void lswi(CPUContext& cpu, Memory& memory, uint32_t rt, uint32_t ra,
           uint32_t byte_count);
-void stswi(CPUContext& cpu, GuestMemory& memory, uint32_t rs, uint32_t ra,
+template <class Memory>
+void stswi(CPUContext& cpu, Memory& memory, uint32_t rs, uint32_t ra,
            uint32_t byte_count);
-void stfiwx(CPUContext& cpu, GuestMemory& memory, uint32_t frs, uint32_t ra,
+template <class Memory>
+void stfiwx(CPUContext& cpu, Memory& memory, uint32_t frs, uint32_t ra,
             uint32_t rb);
-void stfsx(CPUContext& cpu, GuestMemory& memory, uint32_t frs, uint32_t ra,
+template <class Memory>
+void stfsx(CPUContext& cpu, Memory& memory, uint32_t frs, uint32_t ra,
            uint32_t rb);
-void lfsx(CPUContext& cpu, GuestMemory& memory, uint32_t frt, uint32_t ra,
+template <class Memory>
+void lfsx(CPUContext& cpu, Memory& memory, uint32_t frt, uint32_t ra,
           uint32_t rb);
-void lfsux(CPUContext& cpu, GuestMemory& memory, uint32_t frt, uint32_t ra,
+template <class Memory>
+void lfsux(CPUContext& cpu, Memory& memory, uint32_t frt, uint32_t ra,
            uint32_t rb);
-void stfsux(CPUContext& cpu, GuestMemory& memory, uint32_t frs, uint32_t ra,
+template <class Memory>
+void stfsux(CPUContext& cpu, Memory& memory, uint32_t frs, uint32_t ra,
             uint32_t rb);
-void psq_l(CPUContext& cpu, GuestMemory& memory, uint32_t frt, uint32_t ra,
+template <class Memory>
+void psq_l(CPUContext& cpu, Memory& memory, uint32_t frt, uint32_t ra,
            bool w, uint32_t gqr, int32_t displacement);
-void psq_st(CPUContext& cpu, GuestMemory& memory, uint32_t frs, uint32_t ra,
+template <class Memory>
+void psq_st(CPUContext& cpu, Memory& memory, uint32_t frs, uint32_t ra,
             bool w, uint32_t gqr, int32_t displacement);
-void psq_lu(CPUContext& cpu, GuestMemory& memory, uint32_t frt, uint32_t ra,
+template <class Memory>
+void psq_lu(CPUContext& cpu, Memory& memory, uint32_t frt, uint32_t ra,
             bool w, uint32_t gqr, int32_t displacement);
-void psq_stu(CPUContext& cpu, GuestMemory& memory, uint32_t frs, uint32_t ra,
+template <class Memory>
+void psq_stu(CPUContext& cpu, Memory& memory, uint32_t frs, uint32_t ra,
              bool w, uint32_t gqr, int32_t displacement);
 
-void lfs(CPUContext& cpu, GuestMemory& memory, uint32_t frt, uint32_t ra,
+template <class Memory>
+void lfs(CPUContext& cpu, Memory& memory, uint32_t frt, uint32_t ra,
          int32_t displacement);
-void lfsu(CPUContext& cpu, GuestMemory& memory, uint32_t frt, uint32_t ra,
+template <class Memory>
+void lfsu(CPUContext& cpu, Memory& memory, uint32_t frt, uint32_t ra,
           int32_t displacement);
-void lfd(CPUContext& cpu, GuestMemory& memory, uint32_t frt, uint32_t ra,
+template <class Memory>
+void lfd(CPUContext& cpu, Memory& memory, uint32_t frt, uint32_t ra,
          int32_t displacement);
-void stfs(CPUContext& cpu, GuestMemory& memory, uint32_t frs, uint32_t ra,
+template <class Memory>
+void stfs(CPUContext& cpu, Memory& memory, uint32_t frs, uint32_t ra,
           int32_t displacement);
-void stfsu(CPUContext& cpu, GuestMemory& memory, uint32_t frs, uint32_t ra,
+template <class Memory>
+void stfsu(CPUContext& cpu, Memory& memory, uint32_t frs, uint32_t ra,
            int32_t displacement);
 void fdivs(CPUContext& cpu, uint32_t frt, uint32_t fra, uint32_t frb);
 void fres(CPUContext& cpu, uint32_t frt, uint32_t frb);
@@ -203,9 +254,11 @@ void fnmsubs(CPUContext& cpu, uint32_t frt, uint32_t fra, uint32_t frb,
              uint32_t frc);
 void fmsub(CPUContext& cpu, uint32_t frt, uint32_t fra, uint32_t frb,
            uint32_t frc);
-void stfd(CPUContext& cpu, GuestMemory& memory, uint32_t frs, uint32_t ra,
+template <class Memory>
+void stfd(CPUContext& cpu, Memory& memory, uint32_t frs, uint32_t ra,
           int32_t displacement);
-void stfdu(CPUContext& cpu, GuestMemory& memory, uint32_t frs, uint32_t ra,
+template <class Memory>
+void stfdu(CPUContext& cpu, Memory& memory, uint32_t frs, uint32_t ra,
            int32_t displacement);
 void fsubs(CPUContext& cpu, uint32_t frt, uint32_t fra, uint32_t frb);
 void fsub(CPUContext& cpu, uint32_t frt, uint32_t fra, uint32_t frb);
@@ -253,7 +306,8 @@ void ps_nmsub(CPUContext& cpu, uint32_t frt, uint32_t fra, uint32_t frc,
 void ps_nmadd(CPUContext& cpu, uint32_t frt, uint32_t fra, uint32_t frc,
               uint32_t frb);
 
-uint32_t relocated_branch_target(const GuestMemory& memory, uint32_t address,
+template <class Memory>
+uint32_t relocated_branch_target(const Memory& memory, uint32_t address,
                                  uint32_t original, uint32_t fallback);
 void b(CPUContext& cpu, uint32_t target, bool link);
 void bc(CPUContext& cpu, uint32_t target, uint32_t bo, uint32_t bi,

@@ -1045,6 +1045,114 @@ void CafeFilesystem::register_handlers(CafeRuntime& runtime) {
         file->second.stream.clear();
         return success(client);
     });
+    bind("coreinit", "FSGetPosFile", [this](CPUContext& cpu) {
+        const auto client = cpu.gpr[3];
+        const auto mask = cpu.gpr[7];
+        if (const auto failure = command_failure(client, cpu.gpr[4], mask)) {
+            return *failure;
+        }
+        const auto file = files_.find(cpu.gpr[5]);
+        if (file == files_.end() || file->second.client != client) {
+            return finish(client, kErrorInvalidFile, mask);
+        }
+        if (cpu.gpr[6] == 0) {
+            return finish(client, kErrorInvalidBuffer, mask);
+        }
+        memory_.write32(cpu.gpr[6],
+                        static_cast<uint32_t>(file->second.position), cpu.pc);
+        return success(client);
+    });
+    // Mutating calls only reach the save area: "/vol/save/common/..." is the
+    // common slot (0xFF), "/vol/save/8000000N/..." is account slot N.
+    const auto resolve_writable =
+        [this](std::string_view guest, int32_t& detail)
+        -> std::optional<std::filesystem::path> {
+        constexpr std::string_view prefix = "/vol/save/";
+        if (guest.substr(0, prefix.size()) != prefix) {
+            detail = guest.substr(0, 12) == "/vol/content" ? kErrorPermission
+                                                           : kErrorInvalidPath;
+            return std::nullopt;
+        }
+        auto rest = guest.substr(prefix.size());
+        const auto slash = rest.find('/');
+        const auto owner = rest.substr(0, slash);
+        rest = slash == std::string_view::npos ? std::string_view{}
+                                               : rest.substr(slash + 1);
+        uint8_t slot = 0xFF;
+        if (owner != "common") {
+            if (owner.size() != 8) {
+                detail = kErrorInvalidPath;
+                return std::nullopt;
+            }
+            slot = static_cast<uint8_t>(owner.back() - '0');
+        }
+        const auto resolved = resolve_save(slot, rest, true, detail);
+        return resolved ? std::optional{resolved->path} : std::nullopt;
+    };
+    bind("coreinit", "FSMakeDir",
+         [this, resolve_writable](CPUContext& cpu) {
+        const auto client = cpu.gpr[3];
+        const auto mask = cpu.gpr[6];
+        if (const auto failure = command_failure(client, cpu.gpr[4], mask)) {
+            return *failure;
+        }
+        const auto path = guest_string(cpu.gpr[5], kPathLimit, cpu.pc);
+        int32_t detail = kErrorInvalidPath;
+        const auto target = path ? resolve_writable(*path, detail)
+                                 : std::nullopt;
+        if (!target) {
+            return finish(client, detail, mask);
+        }
+        std::error_code error;
+        if (std::filesystem::exists(*target, error)) {
+            return finish(client, kErrorExists, mask);
+        }
+        std::filesystem::create_directories(*target, error);
+        return error ? finish(client, error_from_code(error), mask)
+                     : success(client);
+    });
+    bind("coreinit", "FSRemove", [this, resolve_writable](CPUContext& cpu) {
+        const auto client = cpu.gpr[3];
+        const auto mask = cpu.gpr[6];
+        if (const auto failure = command_failure(client, cpu.gpr[4], mask)) {
+            return *failure;
+        }
+        const auto path = guest_string(cpu.gpr[5], kPathLimit, cpu.pc);
+        int32_t detail = kErrorInvalidPath;
+        const auto target = path ? resolve_writable(*path, detail)
+                                 : std::nullopt;
+        if (!target) {
+            return finish(client, detail, mask);
+        }
+        std::error_code error;
+        if (!std::filesystem::remove(*target, error)) {
+            return finish(client, error ? error_from_code(error)
+                                        : kErrorNotFound,
+                          mask);
+        }
+        return success(client);
+    });
+    bind("coreinit", "FSRename", [this, resolve_writable](CPUContext& cpu) {
+        const auto client = cpu.gpr[3];
+        const auto mask = cpu.gpr[7];
+        if (const auto failure = command_failure(client, cpu.gpr[4], mask)) {
+            return *failure;
+        }
+        const auto from = guest_string(cpu.gpr[5], kPathLimit, cpu.pc);
+        const auto to = guest_string(cpu.gpr[6], kPathLimit, cpu.pc);
+        int32_t detail = kErrorInvalidPath;
+        const auto source = from ? resolve_writable(*from, detail)
+                                 : std::nullopt;
+        const auto target = source && to ? resolve_writable(*to, detail)
+                                         : std::nullopt;
+        if (!source || !target) {
+            return finish(client, detail, mask);
+        }
+        std::error_code error;
+        std::filesystem::rename(*source, *target, error);
+        return error ? finish(client, error_from_code(error), mask)
+                     : success(client);
+    });
     bind("coreinit", "FSOpenDir", [this](CPUContext& cpu) {
         const auto client = cpu.gpr[3];
         const auto mask = cpu.gpr[7];

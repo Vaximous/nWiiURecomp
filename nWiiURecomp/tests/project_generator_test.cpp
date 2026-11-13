@@ -147,42 +147,46 @@ void test_deterministic_project() {
                      "ADDR16_HA relocation reaches native instruction");
     require_contains(shard, "0x02000010: 0x818CA908",
                      "ADDR16_LO relocation reaches native instruction");
-    require_contains(shard, "switch (cpu.pc)",
-                     "shard dispatches local blocks without executor lookup");
-    require_contains(shard, "cpu.native_executor->is_patched(cpu.pc)",
-                     "shard yields to runtime patches between blocks");
+    require_contains(shard, "#include \"runtime/recompiled_shard.h\"",
+                     "shard includes only the slim block header");
+    test::require(shard.find("runtime/executor.h") == std::string::npos,
+                  "shards do not depend on the executor header");
+    require_contains(shard, "static void recomp_02000000(",
+                     "blocks have internal linkage");
     require_contains(shard,
-                     "memory.read32(0x0200000C, 0x0200000C) != 0x3D80C001",
-                     "external host verifies a relocated word before running "
-                     "the block that contains it");
+                     "nwii::runtime::FlatMemory memory(guest_memory);",
+                     "blocks access guest memory through the flat view");
+    require_contains(shard, "cpu.instruction_count += 1;",
+                     "one instruction-count update per block");
+    test::require(shard.find("++cpu.instruction_count;") == std::string::npos,
+                  "no per-instruction count updates");
+    test::require(shard.find("switch (cpu.pc)") == std::string::npos,
+                  "no per-shard dispatcher");
     require_contains(shard,
-                     "memory.read32(0x02000010, 0x02000010) != 0x818CA908",
-                     "every relocated word is verified, not just the first "
-                     "instruction");
-    require_contains(shard, "nwii::runtime::range_has_patch(0x02000000, 1)",
-                     "every block refuses to run if the host patched any word "
-                     "inside it, which a first-instruction check cannot see");
-    require_contains(
-        shard,
-        "memory.read32(0x02000000, 0x02000000) != 0x60000000",
-        "external host defers blocks modified after recompilation");
-
-    require_contains(
-        shard,
-        "executor.register_native(0x02000000, 1, "
-        "&dispatch_recompiled_blocks_0000);",
-        "first block registers the shard dispatcher");
-    require_contains(
-        shard,
-        "executor.register_native(0x02000004, 1, "
-        "&dispatch_recompiled_blocks_0000);",
-        "second block registers the shard dispatcher");
+                     "extern const nwii::runtime::RecompiledBlock "
+                     "kRecompiledShard0000[] = {",
+                     "shard exports its block table");
+    require_contains(shard,
+                     "    {0x02000000, 1, &recomp_02000000, 0x60000000, "
+                     "nwii::runtime::kRecompiledExternalSafe | "
+                     "nwii::runtime::kRecompiledExternalCheck},",
+                     "table entry carries the first word for external hosts");
+    require_contains(shard, "&recomp_0200000C, 0x3D80C001, 0},",
+                     "blocks with relocated words are not external-safe");
+    require_contains(shard, "extern const uint32_t kRecompiledShard0000Size = 3;",
+                     "shard exports its block count");
 
     const auto registry = read_file(first / "registry.cpp");
-    require_contains(registry, "register_recompiled_blocks_0000(executor);",
-                     "registry dispatches bounded shard registration");
+    require_contains(registry, "{kRecompiledShard0000, &kRecompiledShard0000Size},",
+                     "registry lists every shard table");
     require_contains(registry, "void register_recompiled_blocks(",
                      "registry interface");
+    require_contains(registry, "nwii::runtime::range_has_patch(entry.address,",
+                     "registration refuses blocks overlapping a patch");
+    require_contains(registry, "executor.range_patched(entry.address,",
+                     "registration refuses blocks overlapping a runtime patch");
+    require_contains(registry, "executor.host_flat_memory()",
+                     "registration requires flat guest memory");
     require_contains(registry, "find_recompiled_block",
                      "registry exposes static block lookup");
 
@@ -256,6 +260,10 @@ void test_deterministic_project() {
                      "cmake locates module ABI wrapper");
     require_contains(cmake, "SDL3::SDL3",
                      "generated native runner links SDL3");
+    require_contains(cmake,
+                     "target_precompile_headers(wwhd-recompiled PRIVATE "
+                     "<runtime/recompiled_shard.h>)",
+                     "shards share a precompiled header");
 
     std::filesystem::remove_all(root);
 }

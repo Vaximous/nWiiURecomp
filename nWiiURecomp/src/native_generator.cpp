@@ -112,9 +112,10 @@ void validate_instruction(const PpcInstruction& instruction) {
             instruction.xo5() == 31) {
             return;
         }
-        if ((instruction.xo5() == 20 || instruction.xo5() == 21) &&
+        if ((instruction.xo5() == 18 || instruction.xo5() == 20 ||
+             instruction.xo5() == 21) &&
             instruction.frc() == 0) {
-            return;
+            return; // ps_div / ps_sub / ps_add
         }
         if (xo == 26 && instruction.ra() == 0) {
             return;
@@ -124,6 +125,18 @@ void validate_instruction(const PpcInstruction& instruction) {
         }
         if (xo == 40 && instruction.ra() == 0) {
             return;
+        }
+        if ((xo == 72 || xo == 136 || xo == 264) && instruction.ra() == 0) {
+            return; // ps_mr / ps_nabs / ps_abs
+        }
+        if (instruction.xo5() == 24 && instruction.ra() == 0 &&
+            instruction.frc() == 0) {
+            return; // ps_res
+        }
+        if (const uint32_t xo6 = (instruction.raw() >> 1) & 0x3F;
+            xo6 == 6 || xo6 == 7 ||
+            ((xo6 == 38 || xo6 == 39) && instruction.ra() != 0)) {
+            return; // psq_lx / psq_stx / psq_lux / psq_stux
         }
         break;
     case 7:
@@ -183,23 +196,21 @@ void validate_instruction(const PpcInstruction& instruction) {
         }
         throw std::invalid_argument("reserved update store form");
     case 49:
+    case 51:
         if (instruction.ra() != 0) {
             return;
         }
         throw std::invalid_argument("reserved update load form");
     case 57:
-        if (instruction.ra() != 0 && instruction.ps_i() == 0) {
+        if (instruction.ra() != 0) {
             return;
         }
         break;
     case 56:
     case 60:
-        if (instruction.ps_i() != 1 && instruction.ps_i() <= 5) {
-            return;
-        }
-        break;
+        return;
     case 61:
-        if (instruction.ra() != 0 && instruction.ps_i() == 0) {
+        if (instruction.ra() != 0) {
             return;
         }
         break;
@@ -267,7 +278,27 @@ void validate_instruction(const PpcInstruction& instruction) {
         case 1003:
         case 536:
         case 824:
+        case 476: // nand
+        case 284: // eqv
+        case 598: // sync
+        case 854: // eieio
+        case 599: // lfdx
+        case 727: // stfdx
             return;
+        case 234: // addme
+        case 746: // addmeo
+        case 232: // subfme
+        case 744: // subfmeo
+            if (instruction.rb() == 0) {
+                return;
+            }
+            break;
+        case 631: // lfdux
+        case 759: // stfdux
+            if (!instruction.rc() && instruction.ra() != 0) {
+                return;
+            }
+            break;
         case 26:
         case 104:
             if (instruction.rb() == 0) {
@@ -351,15 +382,11 @@ void validate_instruction(const PpcInstruction& instruction) {
             }
             break;
         case 339:
-            if (!instruction.rc() &&
-                (instruction.spr() == 8 || instruction.spr() == 9)) {
-                return;
-            }
-            break;
         case 467:
             if (!instruction.rc() &&
-                (instruction.spr() == 8 || instruction.spr() == 9 ||
-                 (instruction.spr() >= 898 && instruction.spr() <= 901))) {
+                (instruction.spr() == 1 || instruction.spr() == 8 ||
+                 instruction.spr() == 9 ||
+                 nwii::runtime::ppc::is_gqr_spr(instruction.spr()))) {
                 return;
             }
             break;
@@ -389,6 +416,9 @@ void validate_instruction(const PpcInstruction& instruction) {
         }
         if (xo == 24 && instruction.ra() == 0) {
             return;
+        }
+        if (instruction.xo5() == 18 && instruction.frc() == 0) {
+            return; // fdivs
         }
         break;
     case 63:
@@ -443,7 +473,8 @@ void validate_instruction(const PpcInstruction& instruction) {
 void emit_instruction(std::ostringstream& output,
                       const PpcInstruction& instruction, uint32_t address,
                       bool final,
-                      const std::map<uint32_t, uint32_t>& branch_overrides) {
+                      const std::map<uint32_t, uint32_t>& branch_overrides,
+                      bool count_each) {
     validate_instruction(instruction);
     output << "    // " << hex32(address) << ": " << hex32(instruction.raw())
            << '\n';
@@ -452,7 +483,9 @@ void emit_instruction(std::ostringstream& output,
     // ring with a modulo and an optional store on every guest instruction,
     // which only the headless runner ever reads back; on this path it is pure
     // overhead and the module has to keep pace with a JIT.
-    output << "    ++cpu.instruction_count;\n";
+    if (count_each) {
+        output << "    ++cpu.instruction_count;\n";
+    }
 
     const uint32_t opcode = instruction.opcode();
     const uint32_t xo = instruction.extended_opcode();
@@ -464,6 +497,37 @@ void emit_instruction(std::ostringstream& output,
 
     switch (opcode) {
     case 4:
+        if (const uint32_t xo6 = (instruction.raw() >> 1) & 0x3F;
+            xo6 == 6 || xo6 == 7 || xo6 == 38 || xo6 == 39) {
+            const char* name = xo6 == 6    ? "psq_lx"
+                               : xo6 == 7  ? "psq_stx"
+                               : xo6 == 38 ? "psq_lux"
+                                           : "psq_stux";
+            output << "    nwii::runtime::ppc::" << name << "(cpu, memory, "
+                   << instruction.rt() << ", " << instruction.ra() << ", "
+                   << instruction.rb() << ", "
+                   << boolean(((instruction.raw() >> 10) & 1) != 0) << ", "
+                   << ((instruction.raw() >> 7) & 7) << ");\n";
+            return;
+        }
+        if (xo == 72 || xo == 136 || xo == 264) {
+            output << "    nwii::runtime::ppc::"
+                   << (xo == 72 ? "ps_mr" : xo == 136 ? "ps_nabs" : "ps_abs")
+                   << "(cpu, " << instruction.rt() << ", " << instruction.rb()
+                   << ");\n";
+            return;
+        }
+        if (instruction.xo5() == 24) {
+            output << "    nwii::runtime::ppc::ps_res(cpu, "
+                   << instruction.rt() << ", " << instruction.rb() << ");\n";
+            return;
+        }
+        if (instruction.xo5() == 18) {
+            output << "    nwii::runtime::ppc::ps_div(cpu, "
+                   << instruction.rt() << ", " << instruction.ra() << ", "
+                   << instruction.rb() << ");\n";
+            return;
+        }
         if (xo == 528 || xo == 560 || xo == 592 || xo == 624) {
             const char* name = xo == 528   ? "ps_merge00"
                                : xo == 560 ? "ps_merge01"
@@ -872,6 +936,42 @@ void emit_instruction(std::ostringstream& output,
                    << instruction.ra() << ", " << instruction.rs() << ", "
                    << boolean(instruction.rc()) << ");\n";
             return;
+        case 476:
+        case 284:
+            output << "    nwii::runtime::ppc::"
+                   << (xo == 476 ? "nand_" : "eqv") << "(cpu, "
+                   << instruction.ra() << ", " << instruction.rs() << ", "
+                   << instruction.rb() << ", " << boolean(instruction.rc())
+                   << ");\n";
+            return;
+        case 234:
+        case 746:
+        case 232:
+        case 744:
+            output << "    nwii::runtime::ppc::"
+                   << (xo == 234 || xo == 746 ? "addme" : "subfme") << "(cpu, "
+                   << instruction.rt() << ", " << instruction.ra() << ", "
+                   << boolean(xo == 746 || xo == 744) << ", "
+                   << boolean(instruction.rc()) << ");\n";
+            return;
+        case 598:
+        case 854:
+            output << "    nwii::runtime::ppc::"
+                   << (xo == 598 ? "sync" : "eieio") << "(cpu);\n";
+            return;
+        case 599:
+        case 631:
+        case 727:
+        case 759:
+            output << "    nwii::runtime::ppc::"
+                   << (xo == 599   ? "lfdx"
+                       : xo == 631 ? "lfdux"
+                       : xo == 727 ? "stfdx"
+                                   : "stfdux")
+                   << "(cpu, memory, " << instruction.rt() << ", "
+                   << instruction.ra() << ", " << instruction.rb()
+                   << ");\n";
+            return;
         }
         break;
     case 32:
@@ -920,6 +1020,7 @@ void emit_instruction(std::ostringstream& output,
     case 48:
     case 49:
     case 50:
+    case 51:
     case 52:
     case 53:
     case 54:
@@ -927,6 +1028,7 @@ void emit_instruction(std::ostringstream& output,
         const char* name = opcode == 48   ? "lfs"
                            : opcode == 49 ? "lfsu"
                            : opcode == 50 ? "lfd"
+                           : opcode == 51 ? "lfdu"
                            : opcode == 52 ? "stfs"
                            : opcode == 53 ? "stfsu"
                            : opcode == 54 ? "stfd"
@@ -1075,7 +1177,7 @@ std::string generate_native(
     std::string_view name, uint32_t start_address,
     std::span<const uint32_t> instructions,
     const std::map<uint32_t, uint32_t>& branch_overrides,
-    bool require_terminator) {
+    bool require_terminator, const NativeEmitOptions& options) {
     if (!is_identifier(name)) {
         throw std::invalid_argument("invalid native function identifier");
     }
@@ -1095,21 +1197,33 @@ std::string generate_native(
     validate_overrides(start_address, instructions, branch_overrides);
 
     std::ostringstream output;
-    output << "#include \"runtime/cpu_context.h\"\n"
-              "#include \"runtime/memory.h\"\n"
-              "#include \"runtime/ppc_semantics.h\"\n\n"
-              "extern \"C\" void "
-           << name
-           << "(nwii::runtime::CPUContext& cpu,\n"
-              "                               nwii::runtime::GuestMemory& memory) {\n"
-              "    (void)memory;\n";
+    if (options.include_headers) {
+        output << "#include \"runtime/cpu_context.h\"\n"
+                  "#include \"runtime/memory.h\"\n"
+                  "#include \"runtime/ppc_semantics.h\"\n\n";
+    }
+    output << (options.internal_linkage ? "static void " : "extern \"C\" void ")
+           << name << "(nwii::runtime::CPUContext& cpu,\n";
+    if (options.flat_memory) {
+        output << "    nwii::runtime::GuestMemory& guest_memory) {\n"
+                  "    nwii::runtime::FlatMemory memory(guest_memory);\n";
+    } else {
+        output << "                               "
+                  "nwii::runtime::GuestMemory& memory) {\n";
+    }
+    output << "    (void)memory;\n";
+    if (options.batch_instruction_count) {
+        output << "    cpu.instruction_count += " << instructions.size()
+               << ";\n";
+    }
     for (size_t index = 0; index < instructions.size(); ++index) {
         const uint32_t address =
             start_address + static_cast<uint32_t>(index * sizeof(uint32_t));
         try {
             emit_instruction(output, PpcInstruction{instructions[index]},
                              address, index + 1 == instructions.size(),
-                             branch_overrides);
+                             branch_overrides,
+                             !options.batch_instruction_count);
         } catch (const std::invalid_argument& error) {
             throw std::invalid_argument("instruction " + hex32(address) +
                                         " (" + hex32(instructions[index]) +
@@ -1133,7 +1247,16 @@ std::string generate_native_block(
     std::span<const uint32_t> instructions,
     const std::map<uint32_t, uint32_t>& branch_overrides) {
     return generate_native(name, start_address, instructions, branch_overrides,
-                           false);
+                           false, NativeEmitOptions{});
+}
+
+std::string generate_native_block(
+    std::string_view name, uint32_t start_address,
+    std::span<const uint32_t> instructions,
+    const std::map<uint32_t, uint32_t>& branch_overrides,
+    const NativeEmitOptions& options) {
+    return generate_native(name, start_address, instructions, branch_overrides,
+                           false, options);
 }
 
 std::string generate_native_function(
@@ -1141,6 +1264,6 @@ std::string generate_native_function(
     std::span<const uint32_t> instructions,
     const std::map<uint32_t, uint32_t>& branch_overrides) {
     return generate_native(name, start_address, instructions, branch_overrides,
-                           true);
+                           true, NativeEmitOptions{});
 }
 } // namespace nwiiu::recomp

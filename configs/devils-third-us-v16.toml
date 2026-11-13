@@ -1,0 +1,20 @@
+# Devil's Third (US, WUP-P-ADNE), title 0005000010177600, update v16.
+# The profile names the game's executable but ships none of its data: point
+# the CLIs at your own dump's code/DevilsThirdGame-WiiU-Shipping.rpx.
+
+project_name = "Devils Third"
+target_prefix = "devilsthird"
+
+[target]
+name = "Devil's Third US v16"
+product_code = "WUP-P-ADNE"
+title_id = "0005000010177600"
+title_version = 16
+# SHA-256 of the decrypted DevilsThirdGame-WiiU-Shipping.rpx this was set up against.
+sha256 = "0659e26fb0bb8f1d444c401d1fd1dce4a3de568c38e56d54c97b1e3e410cbe75"
+# 0 = use the entry point from the RPX header.
+entry_point = 0
+
+[hle_hooks]
+# No game-specific hooks yet. Find addresses with Ghidra + GhidraRPXLoader and
+# nWiiUAnalyzer/Ghidra/ExportWiiUProfile.java; `nwiiu-run --list-hooks` lists names.

@@ -5,6 +5,8 @@
 #include <array>
 #include <cstdint>
 #include <exception>
+#include <thread>
+#include <vector>
 
 namespace {
 using nwii::runtime::GuestFault;
@@ -85,6 +87,50 @@ void callback_write_bytes(void* context, uint32_t address,
 }
 
 int main() {
+    {
+        // Host-flat backing: existing contents survive the move, later maps
+        // commit in place, and compare_exchange32 is atomic across threads.
+        GuestMemory flat;
+        flat.map(0x10000000, 0x10000, {true, true, false});
+        flat.write32(0x10000010, 0xCAFEBABE, 0);
+        test::require(flat.enable_host_flat(), "host flat reservation");
+        test::require(flat.host_flat(), "host flat active");
+        test::require(flat.read32(0x10000010, 0) == 0xCAFEBABE,
+                      "flat keeps paged contents");
+        flat.map(0x30000000, 0x1000, {true, true, false});
+        flat.write16(0x30000FFE, 0xBEEF, 0);
+        test::require(flat.read16(0x30000FFE, 0) == 0xBEEF,
+                      "flat map after enable");
+        std::array<uint8_t, 4> bytes{};
+        flat.read_bytes(0x10000010, bytes, 0);
+        test::require(bytes == std::array<uint8_t, 4>{0xCA, 0xFE, 0xBA, 0xBE},
+                      "flat bytes are big-endian");
+        test::require(!flat.compare_exchange32(0x10000010, 1, 2, 0),
+                      "cas fails on mismatch");
+        test::require(flat.compare_exchange32(0x10000010, 0xCAFEBABE, 7, 0),
+                      "cas succeeds on match");
+        test::require(flat.read32(0x10000010, 0) == 7, "cas stored");
+        flat.write32(0x10000020, 0, 0);
+        std::vector<std::thread> threads;
+        for (int t = 0; t < 4; ++t) {
+            threads.emplace_back([&flat] {
+                for (int i = 0; i < 100000; ++i) {
+                    while (true) {
+                        const uint32_t seen = flat.read32(0x10000020, 0);
+                        if (flat.compare_exchange32(0x10000020, seen, seen + 1,
+                                                    0)) {
+                            break;
+                        }
+                    }
+                }
+            });
+        }
+        for (auto& thread : threads) {
+            thread.join();
+        }
+        test::require(flat.read32(0x10000020, 0) == 400000,
+                      "cas increments are not lost across threads");
+    }
     GuestMemory sparse;
     sparse.map(0x20000000, 0x20000000, {true, true, false});
     test::require(sparse.mapped_bytes() == 0x20000000ULL, "mapped bytes");

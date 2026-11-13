@@ -6,10 +6,14 @@
 #include <algorithm>
 #include <array>
 #include <limits>
+#include <map>
+#include <set>
 #include <fstream>
 #include <stdexcept>
 #include <iterator>
 #include <string>
+#include <cstdio>
+#include <vector>
 
 namespace nwii::runtime {
 namespace {
@@ -17,6 +21,13 @@ constexpr uint32_t kErreulaHandle = 0x45525245;
 constexpr uint32_t kSwkbdHandle = 0x53574B42;
 constexpr uint32_t kErreulaStub = 0xC1000000;
 constexpr uint32_t kYaz0Decompress = 0x0275F480;
+constexpr uint32_t kMem2HeaderSize = abi::kMem2Start - abi::kMem2Heap;
+// Top of MEM2 is kept for allocations the runtime makes on its own behalf
+// (GHS mutexes, locked cache, shared font). Titles such as UE3 games destroy
+// the default MEM2 heap in __preinit_user and claim OSGetMemBound(MEM2)
+// wholesale, so those must not come from the default heap.
+constexpr uint32_t kRuntimeReserve = 0x02000000;
+constexpr uint32_t kMem2UserEnd = abi::kMem2End - kRuntimeReserve;
 
 template <size_t Size>
 bool guest_string_equals(GuestMemory& memory, uint32_t address,
@@ -29,30 +40,53 @@ bool guest_string_equals(GuestMemory& memory, uint32_t address,
     }
     return true;
 }
+
+// OSDynLoad_FindExport hands each distinct (module, name) its own slot so
+// erreula/swkbd calls can be told apart and logged. Slots are bound to names
+// lazily but registered up front: the executor's handler table must not be
+// mutated while a handler is running.
+constexpr uint32_t kDynExportBase = 0xC1001000;
+constexpr uint32_t kDynExportSlots = 128;
+std::vector<std::string>& dyn_export_names() {
+    static std::vector<std::string> names;
+    return names;
+}
+std::string read_guest_cstring(GuestMemory& memory, uint32_t address,
+                               uint32_t pc) {
+    std::string value;
+    for (uint32_t i = 0; i < 256; ++i) {
+        const auto c = memory.read8(address + i, pc);
+        if (c == 0) break;
+        value.push_back(static_cast<char>(c));
+    }
+    return value;
+}
 } // namespace
 
 CafeCoreinit::CafeCoreinit(
     ExecutionImage& image,
     std::optional<std::filesystem::path> shared_font)
     : image_(image), memory_(image.memory),
+      mem2_heap_(std::max<uint32_t>(
+          abi::kMem2Heap, (image.data_end + 0xFFFFu) & ~0xFFFFu)),
       frame_heaps_{{abi::kMem1Heap,
                     {abi::kMem1Heap, abi::kMem1Start, abi::kMem1End,
                      abi::kMem1Start, abi::kMem1End, 0}},
                    {abi::kFgHeap,
                     {abi::kFgHeap, abi::kFgStart, abi::kFgEnd,
                      abi::kFgStart, abi::kFgEnd, 0}}},
-      expanded_heaps_{{abi::kMem2Heap,
-                       {abi::kMem2Heap,
-                        abi::kMem2Start,
-                        abi::kMem2End,
-                        {{abi::kMem2Start,
-                          abi::kMem2End - abi::kMem2Start}},
+      expanded_heaps_{{mem2_heap_,
+                       {mem2_heap_,
+                        mem2_heap_ + kMem2HeaderSize,
+                        kMem2UserEnd,
+                        {{mem2_heap_ + kMem2HeaderSize,
+                          kMem2UserEnd - mem2_heap_ - kMem2HeaderSize}},
                         {},
                         0,
                         false}}} {
-    constexpr std::array ranges{
+    const std::array ranges{
         std::pair{abi::kCafeSystemStart, abi::kCafeSystemEnd},
-        std::pair{abi::kMem2Heap, abi::kMem2End},
+        std::pair{mem2_heap_, abi::kMem2End},
         std::pair{abi::kFgHeap, abi::kFgEnd},
         std::pair{abi::kMem1Heap, abi::kMem1End},
     };
@@ -82,6 +116,7 @@ CafeCoreinit::CafeCoreinit(
         abi::write_u32(memory_, handle, abi::kHeapDataEndOffset, heap.end, 0);
         abi::write_u32(memory_, handle, abi::kHeapFlagsOffset, heap.flags, 0);
     }
+    private_heap_ = create_expanded_heap(kMem2UserEnd, kRuntimeReserve, 0, 0);
     init_mutex(abi::kGhsMutex, 0);
     abi::write_u32(memory_, abi::kOsSystemInfo, 0, abi::kBusClockSpeed, 0);
     abi::write_u32(memory_, abi::kOsSystemInfo, 4, abi::kCoreClockSpeed, 0);
@@ -168,11 +203,11 @@ void CafeCoreinit::validate_range(uint32_t address, uint32_t size, uint32_t pc,
 uint32_t CafeCoreinit::base_heap(uint32_t type, uint32_t pc) const {
     switch (type) {
     case 0:
-        return abi::kMem1Heap;
+        return base_overrides_[0] ? base_overrides_[0] : abi::kMem1Heap;
     case 1:
-        return abi::kMem2Heap;
+        return base_overrides_[1] ? base_overrides_[1] : mem2_heap_;
     case 8:
-        return abi::kFgHeap;
+        return base_overrides_[2] ? base_overrides_[2] : abi::kFgHeap;
     default:
         fault("invalid base heap", type, 4, pc);
     }
@@ -1076,6 +1111,38 @@ void CafeCoreinit::register_handlers(CafeRuntime& runtime) {
             cpu.gpr[3] = 0;
             return HleAction::return_to_lr;
         });
+    for (uint32_t slot = 0; slot < kDynExportSlots; ++slot) {
+        const std::string symbol = "dyn_" + std::to_string(slot);
+        image_.imports.try_emplace(kDynExportBase + slot * 4,
+                                   ImportTarget{"erreula", symbol});
+        runtime.register_handler(
+            "erreula", symbol,
+            [slot, calls = uint32_t{0}](CPUContext& cpu,
+                                        GuestMemory& memory) mutable {
+                const auto& names = dyn_export_names();
+                const std::string& name =
+                    slot < names.size() ? names[slot] : std::string();
+                if (calls++ < 2 ||
+                    name.find("AppearError") != std::string::npos) {
+                    std::fprintf(stderr,
+                                 "DYNCALL %s r3=%08X r4=%08X lr=%08X\n",
+                                 name.c_str(), cpu.gpr[3], cpu.gpr[4], cpu.lr);
+                }
+                if (name.find("AppearError") != std::string::npos &&
+                    cpu.gpr[3] != 0) {
+                    // nn::erreula::AppearArg: ErrorArg{type, renderTarget,
+                    // controller, unk, errorCode, ...}
+                    std::fprintf(stderr,
+                                 "ERREULA appear type=%u code=%u\n",
+                                 memory.read32(cpu.gpr[3], cpu.pc),
+                                 memory.read32(cpu.gpr[3] + 0x10, cpu.pc));
+                }
+                uint32_t result = 0;
+                if (name.find("Create") != std::string::npos) result = 1;
+                cpu.gpr[3] = result;
+                return HleAction::return_to_lr;
+            });
+    }
     image_.imports.try_emplace(
         kYaz0Decompress, ImportTarget{"runtime", "Yaz0Decompress"});
     runtime.register_handler(
@@ -1131,7 +1198,7 @@ void CafeCoreinit::register_handlers(CafeRuntime& runtime) {
     runtime.register_handler(
         "coreinit", "MEMAllocFromDefaultHeap",
         [this](CPUContext& cpu, GuestMemory&) {
-            cpu.gpr[3] = allocate_expanded(abi::kMem2Heap, cpu.gpr[3], 8,
+            cpu.gpr[3] = allocate_expanded(mem2_heap_, cpu.gpr[3], 8,
                                            cpu.pc);
             return HleAction::return_to_lr;
         });
@@ -1139,14 +1206,14 @@ void CafeCoreinit::register_handlers(CafeRuntime& runtime) {
         "coreinit", "MEMAllocFromDefaultHeapEx",
         [this](CPUContext& cpu, GuestMemory&) {
             cpu.gpr[3] = allocate_expanded(
-                abi::kMem2Heap, cpu.gpr[3], static_cast<int32_t>(cpu.gpr[4]),
+                mem2_heap_, cpu.gpr[3], static_cast<int32_t>(cpu.gpr[4]),
                 cpu.pc);
             return HleAction::return_to_lr;
         });
     runtime.register_handler(
         "coreinit", "MEMFreeToDefaultHeap",
         [this](CPUContext& cpu, GuestMemory&) {
-            free_expanded(abi::kMem2Heap, cpu.gpr[3], cpu.pc);
+            free_expanded(mem2_heap_, cpu.gpr[3], cpu.pc);
             return HleAction::return_to_lr;
         });
     runtime.register_handler(
@@ -1234,17 +1301,14 @@ void CafeCoreinit::register_handlers(CafeRuntime& runtime) {
             memory.validate_range(source, count, cpu.pc, MemoryAccess::read);
             memory.validate_range(destination, count, cpu.pc,
                                   MemoryAccess::write);
-            if (destination > source && destination - source < count) {
-                for (uint32_t remaining = count; remaining != 0; --remaining) {
-                    memory.write8(
-                        destination + remaining - 1,
-                        memory.read8(source + remaining - 1, cpu.pc), cpu.pc);
-                }
-            } else {
-                for (uint32_t index = 0; index < count; ++index) {
-                    memory.write8(destination + index,
-                                  memory.read8(source + index, cpu.pc), cpu.pc);
-                }
+            // memmove semantics via one bulk read then one bulk write; the
+            // per-byte checked copy this replaces was ~5% of title-scene
+            // guest time.
+            static thread_local std::vector<uint8_t> buffer;
+            buffer.resize(count);
+            if (count != 0) {
+                memory.read_bytes(source, buffer, cpu.pc);
+                memory.write_bytes(destination, buffer, cpu.pc);
             }
             cpu.gpr[3] = destination;
             return HleAction::return_to_lr;
@@ -1257,9 +1321,8 @@ void CafeCoreinit::register_handlers(CafeRuntime& runtime) {
             const uint32_t count = cpu.gpr[5];
             memory.validate_range(destination, count, cpu.pc,
                                   MemoryAccess::write);
-            for (uint32_t index = 0; index < count; ++index) {
-                memory.write8(destination + index, value, cpu.pc);
-            }
+            const std::array pattern{value};
+            memory.fill(destination, count, pattern, cpu.pc);
             cpu.gpr[3] = destination;
             return HleAction::return_to_lr;
         });
@@ -1271,9 +1334,8 @@ void CafeCoreinit::register_handlers(CafeRuntime& runtime) {
         [](CPUContext& cpu, GuestMemory& memory) {
             memory.validate_range(cpu.gpr[3], cpu.gpr[4], cpu.pc,
                                   MemoryAccess::write);
-            for (uint32_t index = 0; index < cpu.gpr[4]; ++index) {
-                memory.write8(cpu.gpr[3] + index, 0, cpu.pc);
-            }
+            constexpr std::array<uint8_t, 1> zero{};
+            memory.fill(cpu.gpr[3], cpu.gpr[4], zero, cpu.pc);
             return HleAction::return_to_lr;
         });
     const auto flush_range = [](CPUContext& cpu, GuestMemory& memory) {
@@ -1342,35 +1404,57 @@ void CafeCoreinit::register_handlers(CafeRuntime& runtime) {
                 }
                 return true;
             };
+            (void)matches;
+            (void)language_key;
+            (void)parental_prefix;
+            // Any key is answered: known ones with a US console's values,
+            // the rest (parental controls included) with zeros. Unknown keys
+            // are logged once each so a wrong default can be spotted.
+            static const std::map<std::string, uint32_t> kKnown = {
+                {"cafe.language", 1},   // English
+                {"cafe.cntry_reg", 49}, // United States
+                {"cafe.eula_agree", 1},
+                {"cafe.initial_launch", 2},
+            };
+            static std::set<std::string> logged;
             for (uint32_t index = 0; index < count; ++index) {
                 const uint32_t setting = settings + index * setting_size;
-                const bool is_language =
-                    matches(setting, language_key, sizeof(language_key));
-                const bool is_parental = matches(
-                    setting, parental_prefix, sizeof(parental_prefix) - 1);
-                const uint32_t type = memory.read32(setting + 0x44, cpu.pc);
+                std::string key;
+                for (uint32_t ch = 0; ch < 0x40; ++ch) {
+                    const uint8_t c = memory.read8(setting + ch, cpu.pc);
+                    if (c == 0) {
+                        break;
+                    }
+                    key.push_back(static_cast<char>(c));
+                }
                 const uint32_t size = memory.read32(setting + 0x4C, cpu.pc);
                 const uint32_t output = memory.read32(setting + 0x50, cpu.pc);
-                if ((!is_language || type != 3 || size < 4) &&
-                    (!is_parental || type != 1 || size < 1)) {
-                    throw GuestFault("unsupported UCReadSysConfig setting",
-                                     setting, setting_size, cpu.pc,
-                                     MemoryAccess::read);
-                }
-                memory.validate_range(output, is_language ? 4 : 1, cpu.pc,
-                                      MemoryAccess::write);
-            }
-            for (uint32_t index = 0; index < count; ++index) {
-                const uint32_t setting = settings + index * setting_size;
-                const bool is_language =
-                    matches(setting, language_key, sizeof(language_key));
-                const uint32_t output =
-                    memory.read32(setting + 0x50, cpu.pc);
                 memory.write32(setting + 0x48, 0, cpu.pc);
-                if (is_language) {
-                    memory.write32(output, 1, cpu.pc);
-                } else {
-                    memory.write8(output, 0, cpu.pc);
+                if (output == 0 || size == 0) {
+                    continue;
+                }
+                memory.validate_range(output, size, cpu.pc,
+                                      MemoryAccess::write);
+                for (uint32_t b = 0; b < size; ++b) {
+                    memory.write8(output + b, 0, cpu.pc);
+                }
+                const auto known = kKnown.find(key);
+                if (known != kKnown.end()) {
+                    if (size >= 4) {
+                        memory.write32(output, known->second, cpu.pc);
+                    } else if (size == 2) {
+                        memory.write16(output,
+                                       static_cast<uint16_t>(known->second),
+                                       cpu.pc);
+                    } else {
+                        memory.write8(output,
+                                      static_cast<uint8_t>(known->second),
+                                      cpu.pc);
+                    }
+                } else if (key.rfind("p_acct", 0) != 0 &&
+                           logged.insert(key).second) {
+                    std::fprintf(stderr, "UCReadSysConfig default 0: %s size=%u\n",
+                                 key.c_str(), size);
                 }
             }
             cpu.gpr[3] = 0;
@@ -1389,7 +1473,7 @@ void CafeCoreinit::register_handlers(CafeRuntime& runtime) {
             memory.validate(cpu.gpr[6], 4, cpu.pc, MemoryAccess::write);
             if (shared_font_address_ == 0) {
                 shared_font_address_ = allocate_expanded(
-                    abi::kMem2Heap, static_cast<uint32_t>(shared_font_.size()),
+                    private_heap_, static_cast<uint32_t>(shared_font_.size()),
                     64, cpu.pc);
                 for (size_t index = 0; index < shared_font_.size(); ++index) {
                     memory.write8(
@@ -1470,7 +1554,22 @@ void CafeCoreinit::register_handlers(CafeRuntime& runtime) {
                 cpu.gpr[3] = export_not_found;
                 return HleAction::return_to_lr;
             }
-            memory.write32(cpu.gpr[6], kErreulaStub, cpu.pc);
+            const std::string name =
+                std::string(cpu.gpr[3] == kErreulaHandle ? "erreula:"
+                                                         : "swkbd:") +
+                read_guest_cstring(memory, cpu.gpr[5], cpu.pc);
+            auto& names = dyn_export_names();
+            auto found = std::find(names.begin(), names.end(), name);
+            uint32_t target = kErreulaStub;
+            if (found != names.end()) {
+                target = kDynExportBase +
+                         static_cast<uint32_t>(found - names.begin()) * 4;
+            } else if (names.size() < kDynExportSlots) {
+                target = kDynExportBase +
+                         static_cast<uint32_t>(names.size()) * 4;
+                names.push_back(name);
+            }
+            memory.write32(cpu.gpr[6], target, cpu.pc);
             cpu.gpr[3] = 0;
             return HleAction::return_to_lr;
         });
@@ -2214,7 +2313,7 @@ void CafeCoreinit::register_handlers(CafeRuntime& runtime) {
                       abi::kOsMutexSize, cpu.pc);
             }
             mutexes_.erase(address);
-            free_expanded(abi::kMem2Heap, address, cpu.pc);
+            free_expanded(private_heap_, address, cpu.pc);
             validate_range(pointer, 4, cpu.pc, MemoryAccess::write);
             memory.write32(pointer, 0, cpu.pc);
             return HleAction::return_to_lr;
@@ -2229,9 +2328,9 @@ void CafeCoreinit::register_handlers(CafeRuntime& runtime) {
             }
             validate_range(pointer, 4, cpu.pc, MemoryAccess::write);
             const uint32_t address = allocate_expanded(
-                abi::kMem2Heap, abi::kOsMutexSize, 8, cpu.pc);
+                private_heap_, abi::kOsMutexSize, 8, cpu.pc);
             if (address == 0) {
-                fault("GHS mutex heap exhausted", abi::kMem2Heap, 4,
+                fault("GHS mutex heap exhausted", private_heap_, 4,
                       cpu.pc);
             }
             init_mutex(address, cpu.pc);
@@ -2319,5 +2418,6 @@ void CafeCoreinit::register_handlers(CafeRuntime& runtime) {
             cpu.gpr[3] = destination;
             return HleAction::return_to_lr;
         });
+    register_extra_handlers(runtime);
 }
 } // namespace nwii::runtime

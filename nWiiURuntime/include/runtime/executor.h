@@ -75,6 +75,14 @@ public:
     bool is_patched(uint32_t address) const {
         return patched_addresses_.contains(address);
     }
+    // Any runtime patch inside [start, start + 4 * instruction_count).
+    bool range_patched(uint32_t start, uint64_t instruction_count) const {
+        const auto found = patched_addresses_.lower_bound(start);
+        return found != patched_addresses_.end() &&
+               *found < uint64_t{start} + instruction_count * 4;
+    }
+    // Recompiled blocks address guest memory through FlatMemory.
+    bool host_flat_memory() const { return image_.memory.host_flat(); }
     uint64_t native_dispatch_count() const { return native_dispatch_count_; }
     uint64_t native_fallback_count() const { return native_fallback_count_; }
     void register_hle(uint32_t address, HleHandler handler);

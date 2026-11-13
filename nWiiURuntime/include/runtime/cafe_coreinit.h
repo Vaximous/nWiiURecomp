@@ -27,6 +27,15 @@ public:
 
     void attach_machine(Machine& machine);
     void register_handlers(CafeRuntime& runtime);
+    // Imports beyond WWHD's set (cafe_coreinit_extra.cpp).
+    void register_extra_handlers(CafeRuntime& runtime);
+    // Non-blocking OSSendMessage of the 16-byte OSMessage at `message`;
+    // returns false when the queue is full.
+    bool post_message(uint32_t queue, uint32_t message, CPUContext& cpu);
+    uint32_t mem2_heap() const { return mem2_heap_; }
+    // Points the main thread at the image's __preinit_user export (if any),
+    // returning into the entry point afterwards, as the Cafe loader does.
+    void begin_preinit(CPUContext& main);
 
     uint32_t base_heap(uint32_t type, uint32_t pc = 0) const;
     uint32_t create_expanded_heap(uint32_t base, uint32_t size,
@@ -117,6 +126,26 @@ private:
         std::vector<uint32_t> granted;
     };
 
+    struct BlockHeap {
+        uint32_t start;
+        uint32_t end;
+        std::map<uint32_t, uint32_t> used; // address -> size
+    };
+
+    struct CondWait {
+        uint32_t cond;
+        uint32_t mutex;
+        uint32_t recursion;
+        bool fast;
+        bool signaled;
+    };
+
+    HleAction acquire_lock(MutexState& state, uint32_t address,
+                           CPUContext& cpu);
+    uint32_t release_lock(MutexState& state);
+    HleAction cond_wait(CPUContext& cpu, bool fast);
+    void cond_signal(uint32_t cond);
+
     [[noreturn]] void fault(const char* reason, uint32_t address,
                             uint32_t width, uint32_t pc,
                             MemoryAccess access = MemoryAccess::read) const;
@@ -154,6 +183,9 @@ private:
 
     ExecutionImage& image_;
     GuestMemory& memory_;
+    // MEM2 default heap handle: abi::kMem2Heap for images that fit below it
+    // (WWHD), otherwise the first 64 KiB boundary after the image's data.
+    uint32_t mem2_heap_;
     Machine* machine_{};
     std::map<uint32_t, FrameHeap> frame_heaps_;
     std::map<uint32_t, ExpandedHeap> expanded_heaps_;
@@ -167,6 +199,15 @@ private:
     uint16_t next_thread_id_{2};
     uint64_t ticks_{};
     std::map<uint32_t, EventState> events_;
+    std::map<uint32_t, MutexState> fast_mutexes_;
+    std::map<uint32_t, std::vector<uint32_t>> cond_waiters_;
+    std::map<uint32_t, CondWait> cond_waits_; // by thread
+    std::map<uint32_t, uint64_t> timed_waits_; // thread -> deadline tick
+    std::map<uint32_t, BlockHeap> block_heaps_;
+    uint32_t system_message_queue_{};
+    uint32_t private_heap_{};
+    // MEM1, MEM2, FG handles a title installed via __preinit_user.
+    std::array<uint32_t, 3> base_overrides_{};
     uint64_t wait_sequence_{};
     bool home_button_menu_enabled_{true};
     bool dim_enabled_{true};

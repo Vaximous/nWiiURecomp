@@ -21,6 +21,9 @@ struct ExecutionImage {
     uint32_t stack_top{};
     uint32_t sda_base{};
     uint32_t sda2_base{};
+    // End of the highest loaded section in the 0x10000000 data region. Cafe
+    // OS places the MEM2 default heap after it.
+    uint32_t data_end{};
     std::map<uint32_t, uint32_t> branch_overrides;
     std::map<uint32_t, ImportTarget> imports;
 };

@@ -21,7 +21,8 @@
 
 namespace nwiiu::recomp {
 namespace {
-constexpr size_t kBlocksPerShard = 128;
+constexpr size_t kBlocksPerShard = 512;
+constexpr NativeEmitOptions kShardEmitOptions{true, true, true, false};
 
 // Profile strings reach the generated sources as C++ literals. Nothing in a
 // profile is trusted to be identifier-safe, so escape rather than assume.
@@ -103,17 +104,10 @@ std::string shard_name(size_t index) {
     return output.str();
 }
 
-std::string registration_name(size_t index) {
+std::string table_name(size_t index) {
     std::ostringstream output;
-    output << "register_recompiled_blocks_" << std::setw(4)
-           << std::setfill('0') << index;
-    return output.str();
-}
-
-std::string dispatch_name(size_t index) {
-    std::ostringstream output;
-    output << "dispatch_recompiled_blocks_" << std::setw(4)
-           << std::setfill('0') << index;
+    output << "kRecompiledShard" << std::setw(4) << std::setfill('0')
+           << index;
     return output.str();
 }
 
@@ -185,52 +179,49 @@ std::map<uint32_t, uint32_t> block_overrides(
 std::string registry_source(std::span<const TranslatedBlock> blocks,
                             size_t shard_count) {
     std::ostringstream output;
-    output << "#include \"runtime/executor.h\"\n\n"
-              "#include <algorithm>\n"
-              "#include <array>\n"
-              "#include <vector>\n"
-              "#include <cstdint>\n\n";
+    output << "#include \"runtime/executor.h\"\n"
+              "#include \"runtime/patch_guard.h\"\n"
+              "#include \"runtime/recompiled_shard.h\"\n\n"
+              "#include <cstdint>\n"
+              "#include <cstdio>\n"
+              "#include <vector>\n\n";
     for (size_t shard = 0; shard < shard_count; ++shard) {
-        output << "extern \"C\" void " << dispatch_name(shard)
-               << "(nwii::runtime::CPUContext&, "
-                  "nwii::runtime::GuestMemory&);\n";
-        output << "void " << registration_name(shard)
-               << "(nwii::runtime::Executor& executor);\n";
-    }
-    output << "\nnamespace {\n"
-              "struct RecompiledBlock {\n"
-              "    uint32_t address;\n"
-              "    nwii::runtime::NativeThunk thunk;\n"
-              "};\n"
-              "constexpr std::array<RecompiledBlock, "
-           << blocks.size() << "> kRecompiledBlocks{{\n";
-    for (size_t index = 0; index < blocks.size(); ++index) {
-        output << "    {" << hex32(blocks[index].block.start) << ", &"
-               << dispatch_name(index / kBlocksPerShard) << "},\n";
+        output << "extern const nwii::runtime::RecompiledBlock "
+               << table_name(shard) << "[];\n"
+               << "extern const uint32_t " << table_name(shard) << "Size;\n";
     }
     const uint32_t range_lo = blocks.empty() ? 0u : blocks.front().block.start;
-    const uint32_t range_hi = blocks.empty() ? 0u : blocks.back().block.start + 4u;
-    output << "}};\n"
+    const uint32_t range_hi =
+        blocks.empty() ? 0u : blocks.back().block.start + 4u;
+    output << "\nnamespace {\n"
+              "struct ShardTable {\n"
+              "    const nwii::runtime::RecompiledBlock* blocks;\n"
+              "    const uint32_t* size;\n"
+              "};\n"
+              "const ShardTable kShards[] = {\n";
+    for (size_t shard = 0; shard < shard_count; ++shard) {
+        output << "    {" << table_name(shard) << ", &" << table_name(shard)
+               << "Size},\n";
+    }
+    output << "};\n"
               "constexpr uint32_t kBlockRangeLo = "
            << hex32(range_lo)
-           << ";\nconstexpr uint32_t kBlockRangeHi = "
-           << hex32(range_hi)
+           << ";\nconstexpr uint32_t kBlockRangeHi = " << hex32(range_hi)
            << ";\n"
               "}\n\n"
-              "// One indexed load rather than a binary search over every block.\n"
-              "// The search was about nineteen dependent random accesses into a\n"
-              "// table far larger than L2, and it runs once per recompiled\n"
-              "// block: measured at 146ns against 13ns for this table, it was\n"
-              "// the majority of the module's run time.\n"
-              "nwii::runtime::NativeThunk find_recompiled_block("
+              "// One indexed load rather than a search: the module looks a\n"
+              "// block up for every block it runs.\n"
+              "const nwii::runtime::RecompiledBlock* find_recompiled_entry("
               "uint32_t address) {\n"
-              "    static const std::vector<nwii::runtime::NativeThunk> index = "
-              "[] {\n"
-              "        std::vector<nwii::runtime::NativeThunk> table(\n"
+              "    static const auto index = [] {\n"
+              "        std::vector<const nwii::runtime::RecompiledBlock*> table(\n"
               "            (kBlockRangeHi - kBlockRangeLo) / 4, nullptr);\n"
-              "        for (const auto& entry : kRecompiledBlocks) {\n"
-              "            table[(entry.address - kBlockRangeLo) / 4] = "
-              "entry.thunk;\n"
+              "        for (const auto& shard : kShards) {\n"
+              "            for (uint32_t i = 0; i < *shard.size; ++i) {\n"
+              "                const auto& entry = shard.blocks[i];\n"
+              "                table[(entry.address - kBlockRangeLo) / 4] = "
+              "&entry;\n"
+              "            }\n"
               "        }\n"
               "        return table;\n"
               "    }();\n"
@@ -240,12 +231,36 @@ std::string registry_source(std::span<const TranslatedBlock> blocks,
               "    }\n"
               "    return index[(address - kBlockRangeLo) / 4];\n"
               "}\n\n"
+              "nwii::runtime::NativeThunk find_recompiled_block("
+              "uint32_t address) {\n"
+              "    const auto* entry = find_recompiled_entry(address);\n"
+              "    return entry == nullptr ? nullptr : entry->thunk;\n"
+              "}\n\n"
+              "// Every check that used to run per dispatch is fixed once the\n"
+              "// runtime has installed its patches, so it is decided here.\n"
               "void register_recompiled_blocks("
-              "nwii::runtime::Executor& executor) {\n";
-    for (size_t shard = 0; shard < shard_count; ++shard) {
-        output << "    " << registration_name(shard) << "(executor);\n";
-    }
-    output << "}\n";
+              "nwii::runtime::Executor& executor) {\n"
+              "    if (!executor.host_flat_memory()) {\n"
+              "        std::fprintf(stderr, \"recompiled blocks need host-flat "
+              "guest memory; running interpreted\\n\");\n"
+              "        return;\n"
+              "    }\n"
+              "    for (const auto& shard : kShards) {\n"
+              "        for (uint32_t i = 0; i < *shard.size; ++i) {\n"
+              "            const auto& entry = shard.blocks[i];\n"
+              "            if (nwii::runtime::range_has_patch(entry.address,\n"
+              "                                               "
+              "entry.instruction_count) ||\n"
+              "                executor.range_patched(entry.address,\n"
+              "                                       entry.instruction_count)) {\n"
+              "                continue;\n"
+              "            }\n"
+              "            executor.register_native(entry.address,\n"
+              "                                     entry.instruction_count,\n"
+              "                                     entry.thunk);\n"
+              "        }\n"
+              "    }\n"
+              "}\n";
     return output.str();
 }
 
@@ -326,6 +341,10 @@ int main(int argc, char** argv) {
         const auto options = nwiiu::recomp::parse_runner_options(arguments);
         auto rpx = nwiiu::analyzer::load_rpx(options.input, profile_target());
         auto image = nwii::runtime::make_execution_image(rpx);
+        // Recompiled blocks address guest memory as one flat host range.
+        if (!image.memory.enable_host_flat()) {
+            std::cerr << "warning: no flat host mapping for guest memory\n";
+        }
         nwii::runtime::Machine machine(image, options.title_root,
                                        options.save_root, options.shared_font,
                                        profile_hooks());
@@ -386,13 +405,14 @@ std::string module_source(const analyzer::GameConfig& config) {
 #include "runtime/executor.h"
 #include "runtime/memory.h"
 #include "runtime/patch_guard.h"
+#include "runtime/recompiled_shard.h"
 
 #include <algorithm>
 #include <cstdint>
 #include <exception>
 #include <limits>
 
-nwii::runtime::NativeThunk find_recompiled_block(uint32_t address);
+const nwii::runtime::RecompiledBlock* find_recompiled_entry(uint32_t address);
 
 namespace {
 nwii::runtime::CPUContext to_runtime(const nwiiu_static_cpu_state& source,
@@ -446,8 +466,12 @@ uint32_t run(nwiiu_static_cpu_state* cpu,
     if (cpu == nullptr || memory == nullptr || instruction_limit == 0) {
         return NWIIU_STATIC_RESULT_MISS;
     }
-    const auto thunk = find_recompiled_block(cpu->pc);
-    if (thunk == nullptr) {
+    // Blocks address guest memory directly through the host's flat mapping.
+    if (memory->flat_base == nullptr ||
+        memory->flat_size < (uint64_t{1} << 32)) {
+        return NWIIU_STATIC_RESULT_MISS;
+    }
+    if (find_recompiled_entry(cpu->pc) == nullptr) {
         return NWIIU_STATIC_RESULT_MISS;
     }
     auto runtime_cpu = to_runtime(*cpu, instruction_limit);
@@ -468,18 +492,33 @@ uint32_t run(nwiiu_static_cpu_state* cpu,
         // side and twice here, for an average of about thirty guest
         // instructions of work. Staying in until a miss or the budget runs out
         // amortises all four copies.
+        // An external host may have relocated or patched code after
+        // recompilation, so each block is checked before it runs: blocks with
+        // relocated words are left to the host, others must still start with
+        // the word they were built from and contain no host patch.
+        const auto runnable = [&](uint32_t pc)
+            -> const nwii::runtime::RecompiledBlock* {
+            const auto* entry = find_recompiled_entry(pc);
+            if (entry == nullptr ||
+                (entry->flags & nwii::runtime::kRecompiledExternalSafe) == 0 ||
+                entry->instruction_count >
+                    runtime_cpu.native_instruction_endpoint -
+                        runtime_cpu.instruction_count ||
+                nwii::runtime::range_has_patch(entry->address,
+                                               entry->instruction_count)) {
+                return nullptr;
+            }
+            if ((entry->flags & nwii::runtime::kRecompiledExternalCheck) != 0 &&
+                runtime_memory.read32(entry->address, entry->address) !=
+                    entry->first_word) {
+                return nullptr;
+            }
+            return entry;
+        };
         const auto entry_count = runtime_cpu.instruction_count;
-        auto next = thunk;
-        while (next != nullptr) {
-            const auto before = runtime_cpu.instruction_count;
-            next(runtime_cpu, runtime_memory);
-            if (runtime_cpu.instruction_count == before) {
-                break;  // the block refused: a guard fired or the budget is out
-            }
-            if (runtime_cpu.instruction_count >= instruction_limit) {
-                break;
-            }
-            next = find_recompiled_block(runtime_cpu.pc);
+        for (const auto* next = runnable(runtime_cpu.pc); next != nullptr;
+             next = runnable(runtime_cpu.pc)) {
+            next->thunk(runtime_cpu, runtime_memory);
         }
         if (runtime_cpu.instruction_count == entry_count) {
             return NWIIU_STATIC_RESULT_MISS;
@@ -529,6 +568,9 @@ std::string program_cmake_source(size_t shard_count, const std::string& prefix) 
            << " PROPERTIES POSITION_INDEPENDENT_CODE ON)\n"
            << "target_link_libraries(" << objects
            << " PRIVATE nwiiu_recomp)\n"
+           // Every shard parses the same runtime headers; precompile them.
+           << "target_precompile_headers(" << objects
+           << " PRIVATE <runtime/recompiled_shard.h>)\n"
            << "add_executable(" << native << "\n"
            << "    ${CMAKE_CURRENT_LIST_DIR}/main.cpp\n"
            << "    $<TARGET_OBJECTS:" << objects << ">\n"
@@ -536,6 +578,19 @@ std::string program_cmake_source(size_t shard_count, const std::string& prefix) 
            << "find_package(SDL3 3.2 REQUIRED CONFIG)\n"
            << "target_link_libraries(" << native
            << " PRIVATE nwiiu_recomp SDL3::SDL3)\n"
+           // Windows: copy the toolchain's runtime DLLs (libstdc++, SDL3,
+           // shaderc, zlib, ...) next to the exe so it runs from Explorer
+           // without MSYS2 on PATH.
+           << "if(WIN32)\n"
+           << "  get_filename_component(NWIIU_TOOLCHAIN_BIN "
+              "\"${CMAKE_CXX_COMPILER}\" DIRECTORY)\n"
+           << "  add_custom_command(TARGET " << native << " POST_BUILD\n"
+           << "    COMMAND ${CMAKE_COMMAND} \"-DEXE=$<TARGET_FILE:" << native
+           << ">\" \"-DSEARCH_DIRS=${NWIIU_TOOLCHAIN_BIN}\" "
+              "\"-DOBJDUMP=${CMAKE_OBJDUMP}\" "
+              "-P \"${PROJECT_SOURCE_DIR}/cmake/bundle_runtime_dlls.cmake\"\n"
+           << "    VERBATIM)\n"
+           << "endif()\n"
            << "add_library(" << module << " SHARED\n"
            << "    ${CMAKE_CURRENT_LIST_DIR}/module.cpp\n"
            << "    $<TARGET_OBJECTS:" << objects << ">\n"
@@ -648,7 +703,7 @@ ProjectSummary generate_native_project(
                  external_safe && !overrides.contains(block.start),
                  std::move(relocated_words),
                  generate_native_block(symbol, block.start, instructions,
-                                       overrides)});
+                                       overrides, kShardEmitOptions)});
             instruction_count += block.instruction_count;
         } catch (const std::exception& error) {
             diagnostics.emplace_back(block.start, error.what());
@@ -678,73 +733,30 @@ ProjectSummary generate_native_project(
             }
             source += translated[index].source;
         }
-        source.insert(0, "#include \"runtime/executor.h\"\n"
-                      "#include \"runtime/patch_guard.h\"\n\n");
-        const std::string dispatcher = dispatch_name(shard);
-        source += "\nextern \"C\" void " + dispatcher +
-                  "(nwii::runtime::CPUContext& cpu, "
-                  "nwii::runtime::GuestMemory& memory) {\n"
-                  "    while (cpu.instruction_count < "
-                  "cpu.native_instruction_endpoint) {\n"
-                  "        if (cpu.native_executor != nullptr &&\n"
-                  "            cpu.native_executor->is_patched(cpu.pc)) return;\n"
-                  "        switch (cpu.pc) {\n";
+        source.insert(0, "#include \"runtime/recompiled_shard.h\"\n\n");
+        // The shard's table is the only reference to its blocks; the runtime
+        // chains between them through its own page table, so there is no
+        // per-shard dispatcher and every per-dispatch check (patches,
+        // budget) is decided once at registration or in the executor.
+        source += "\nextern const nwii::runtime::RecompiledBlock " +
+                  table_name(shard) + "[] = {\n";
         for (size_t index = begin; index < end; ++index) {
             const auto& translated_block = translated[index];
-            source += "        case " +
-                      hex32(translated_block.block.start) + ":\n"
-                      "            if (nwii::runtime::range_has_patch(" +
-                      hex32(translated_block.block.start) + ", " +
+            std::string flags = "0";
+            if (translated_block.external_safe) {
+                flags = translated_block.external_check
+                            ? "nwii::runtime::kRecompiledExternalSafe | "
+                              "nwii::runtime::kRecompiledExternalCheck"
+                            : "nwii::runtime::kRecompiledExternalSafe";
+            }
+            source += "    {" + hex32(translated_block.block.start) + ", " +
                       std::to_string(translated_block.block.instruction_count) +
-                      ")) return;\n";
-            if (!translated_block.external_safe) {
-                // These blocks hold loader-relocated words. The execution image
-                // already applied those relocations, so the baked code is
-                // correct as long as the host loaded the same image; verify each
-                // relocated word rather than refusing the block outright.
-                for (const auto& [word_address, expected] :
-                     translated_block.relocated_words) {
-                    source +=
-                        "            if (cpu.native_executor == nullptr &&\n"
-                        "                memory.read32(" +
-                        hex32(word_address) + ", " + hex32(word_address) +
-                        ") != " + hex32(expected) + ") return;\n";
-                }
-            }
-            if (translated_block.external_check) {
-                source +=
-                    "            // ponytail: one host read per block; add a "
-                    "code-patch generation callback if profiling warrants it.\n"
-                    "            if (cpu.native_executor == nullptr &&\n"
-                    "                memory.read32(" +
-                    hex32(translated_block.block.start) + ", " +
-                    hex32(translated_block.block.start) + ") != " +
-                    hex32(translated_block.first_instruction) + ") return;\n";
-            }
-            source +=
-                "            if (" +
-                std::to_string(translated_block.block.instruction_count) +
-                " > cpu.native_instruction_endpoint - "
-                "cpu.instruction_count) return;\n"
-                "            " +
-                translated_block.symbol + "(cpu, memory);\n"
-                "            break;\n";
+                      ", &" + translated_block.symbol + ", " +
+                      hex32(translated_block.first_instruction) + ", " + flags +
+                      "},\n";
         }
-        source += "        default:\n"
-                  "            return;\n"
-                  "        }\n"
-                  "    }\n"
-                  "}\n";
-
-        source += "\nvoid " + registration_name(shard) +
-                  "(nwii::runtime::Executor& executor) {\n";
-        for (size_t index = begin; index < end; ++index) {
-            source += "    executor.register_native(" +
-                      hex32(translated[index].block.start) + ", " +
-                      std::to_string(translated[index].block.instruction_count) +
-                      ", &" + dispatcher + ");\n";
-        }
-        source += "}\n";
+        source += "};\nextern const uint32_t " + table_name(shard) +
+                  "Size = " + std::to_string(end - begin) + ";\n";
         files.emplace_back(shard_name(shard), std::move(source));
     }
     files.emplace_back("registry.cpp", registry_source(translated, shard_count));

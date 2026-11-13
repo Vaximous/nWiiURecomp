@@ -7,8 +7,66 @@
 #include <limits>
 #include <utility>
 
+#if defined(_WIN32)
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#else
+#include <sys/mman.h>
+#endif
+
 namespace nwii::runtime {
 namespace {
+// Cached: getenv takes a lock and scans the environment on every call,
+// and these sit on per-access / per-dispatch paths.
+inline bool env_nwiiu_matrix_trace() {
+    static const bool enabled = std::getenv("NWIIU_MATRIX_TRACE") != nullptr;
+    return enabled;
+}
+inline bool env_nwiiu_pool_trace() {
+    static const bool enabled = std::getenv("NWIIU_POOL_TRACE") != nullptr;
+    return enabled;
+}
+} // namespace
+namespace {
+// 4 GiB of guest space plus slack so an access at 0xFFFFFFFC of up to
+// eight bytes (or a 32-byte cache-line op) never leaves the reservation.
+constexpr uint64_t kHostFlatSize = (uint64_t{1} << 32) + 0x10000;
+
+uint8_t* host_reserve() {
+#if defined(_WIN32)
+    return static_cast<uint8_t*>(
+        VirtualAlloc(nullptr, kHostFlatSize, MEM_RESERVE, PAGE_NOACCESS));
+#else
+    void* base = mmap(nullptr, kHostFlatSize, PROT_NONE,
+                      MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
+    return base == MAP_FAILED ? nullptr : static_cast<uint8_t*>(base);
+#endif
+}
+
+void host_release(uint8_t* base) {
+#if defined(_WIN32)
+    VirtualFree(base, 0, MEM_RELEASE);
+#else
+    munmap(base, kHostFlatSize);
+#endif
+}
+
+bool host_commit(uint8_t* base, uint32_t address, uint64_t size) {
+    const uint64_t start = address & ~uint64_t{0xFFFF};
+    const uint64_t end = (uint64_t{address} + size + 0xFFFF) & ~uint64_t{0xFFFF};
+#if defined(_WIN32)
+    return VirtualAlloc(base + start, end - start, MEM_COMMIT,
+                        PAGE_READWRITE) != nullptr;
+#else
+    return mprotect(base + start, end - start, PROT_READ | PROT_WRITE) == 0;
+#endif
+}
+
 bool permits(MemoryPermissions permissions, MemoryAccess access) {
     switch (access) {
     case MemoryAccess::read:
@@ -84,6 +142,10 @@ void GuestMemory::map(uint32_t address, uint32_t size,
         }
     }
 
+    if (flat_owner_ != nullptr &&
+        !host_commit(flat_owner_.get(), address, size)) {
+        throw std::runtime_error("host could not commit guest memory");
+    }
     mappings_.insert(next, Mapping{address, size, permissions});
     for (std::size_t copied = 0; copied < initial.size();) {
         const uint32_t current = address + static_cast<uint32_t>(copied);
@@ -103,7 +165,36 @@ uint64_t GuestMemory::mapped_bytes() const {
 }
 
 uint64_t GuestMemory::resident_bytes() const {
+    if (flat_owner_ != nullptr) {
+        return mapped_bytes();
+    }
     return static_cast<uint64_t>(pages_.size()) * kPageSize;
+}
+
+bool GuestMemory::enable_host_flat() {
+    if (flat_owner_ != nullptr) {
+        return true;
+    }
+    if (external()) {
+        return false;
+    }
+    uint8_t* base = host_reserve();
+    if (base == nullptr) {
+        return false;
+    }
+    std::shared_ptr<uint8_t> owner(base, host_release);
+    for (const auto& mapping : mappings_) {
+        if (!host_commit(base, mapping.address, mapping.size)) {
+            return false;
+        }
+    }
+    for (const auto& [number, data] : pages_) {
+        std::memcpy(base + (uint64_t{number} << 12), data.data(), kPageSize);
+    }
+    pages_.clear();
+    flat_owner_ = std::move(owner);
+    flat_base_ = base;
+    return true;
 }
 
 void GuestMemory::check(uint32_t address, uint32_t width, uint32_t pc,
@@ -210,19 +301,55 @@ void GuestMemory::validate_range(uint32_t address, uint32_t size, uint32_t pc,
     }
 }
 
+namespace {
+// One-entry lookup cache in front of pages_ (an unordered_map hit per guest
+// access dominated standalone runs, which have no flat mapping). Pages are
+// never erased and unordered_map element addresses survive rehashing, so a
+// cached pointer stays valid; the size tag guards a new GuestMemory reusing
+// a destroyed one's address.
+struct PageCache {
+    const void* owner{};
+    size_t generation{};
+    uint32_t page{0xFFFFFFFFu};
+    uint8_t* data{};
+};
+thread_local PageCache g_page_cache;
+} // namespace
+
 const uint8_t* GuestMemory::page(uint32_t address) const {
-    const auto found = pages_.find(address >> 12);
+    if (flat_owner_ != nullptr) {
+        return flat_base_ + address;
+    }
+    auto& cache = g_page_cache;
+    const uint32_t number = address >> 12;
+    if (cache.owner == this && cache.page == number &&
+        cache.generation == pages_.size()) {
+        return cache.data + (address & (kPageSize - 1));
+    }
+    const auto found = pages_.find(number);
     if (found == pages_.end()) {
         return nullptr;
     }
+    cache = {this, pages_.size(), number,
+             const_cast<uint8_t*>(found->second.data())};
     return found->second.data() + (address & (kPageSize - 1));
 }
 
 uint8_t* GuestMemory::page(uint32_t address) {
-    auto [found, inserted] = pages_.try_emplace(address >> 12);
+    if (flat_owner_ != nullptr) {
+        return mutable_flat() + address;
+    }
+    auto& cache = g_page_cache;
+    const uint32_t number = address >> 12;
+    if (cache.owner == this && cache.page == number &&
+        cache.generation == pages_.size()) {
+        return cache.data + (address & (kPageSize - 1));
+    }
+    auto [found, inserted] = pages_.try_emplace(number);
     if (inserted) {
         found->second.fill(0);
     }
+    cache = {this, pages_.size(), number, found->second.data()};
     return found->second.data() + (address & (kPageSize - 1));
 }
 
@@ -310,7 +437,7 @@ void GuestMemory::write8_slow(uint32_t address, uint8_t value, uint32_t pc) {
     }
     check(address, 1, pc, MemoryAccess::write);
     if ((address == 0x39DE6FE0u || address == 0x39DE7000u) &&
-        std::getenv("NWIIU_POOL_TRACE") != nullptr) {
+        env_nwiiu_pool_trace()) {
         std::fprintf(stderr, "POOLBYTE pc=%08X address=%08X value=%02X\n",
                      pc, address, value);
     }
@@ -323,7 +450,7 @@ void GuestMemory::write16_slow(uint32_t address, uint16_t value, uint32_t pc) {
         return;
     }
     check(address, 2, pc, MemoryAccess::write);
-    if (std::getenv("NWIIU_POOL_TRACE") != nullptr &&
+    if (env_nwiiu_pool_trace() &&
         ((address <= 0x39DE6FE0u && 0x39DE6FE0u - address < 2) ||
          (address <= 0x39DE7000u && 0x39DE7000u - address < 2))) {
         std::fprintf(stderr, "POOL16 pc=%08X address=%08X value=%04X\n",
@@ -348,13 +475,13 @@ void GuestMemory::write32_slow(uint32_t address, uint32_t value, uint32_t pc) {
         return;
     }
     check(address, 4, pc, MemoryAccess::write);
-    if (std::getenv("NWIIU_POOL_TRACE") != nullptr &&
+    if (env_nwiiu_pool_trace() &&
         (address == 0x39DE6FE0u || address == 0x39DE7000u) &&
         value > 0x100000u) {
         std::fprintf(stderr, "POOL32 pc=%08X address=%08X value=%08X\n",
                      pc, address, value);
     }
-    if (std::getenv("NWIIU_MATRIX_TRACE") != nullptr &&
+    if (env_nwiiu_matrix_trace() &&
         overlaps_matrix_trace(address, 4)) {
         std::fprintf(stderr, "MATRIX32 pc=%08X address=%08X value=%08X\n",
                      pc, address, value);
@@ -380,13 +507,13 @@ void GuestMemory::write64_slow(uint32_t address, uint64_t value, uint32_t pc) {
         return;
     }
     check(address, 8, pc, MemoryAccess::write);
-    if (std::getenv("NWIIU_POOL_TRACE") != nullptr &&
+    if (env_nwiiu_pool_trace() &&
         ((address <= 0x39DE6FE0u && 0x39DE6FE0u - address < 8) ||
          (address <= 0x39DE7000u && 0x39DE7000u - address < 8))) {
         std::fprintf(stderr, "POOL64 pc=%08X address=%08X value=%016llX\n",
                      pc, address, static_cast<unsigned long long>(value));
     }
-    if (std::getenv("NWIIU_MATRIX_TRACE") != nullptr &&
+    if (env_nwiiu_matrix_trace() &&
         overlaps_matrix_trace(address, 8)) {
         std::fprintf(stderr, "MATRIX64 pc=%08X address=%08X value=%016llX\n",
                      pc, address, static_cast<unsigned long long>(value));
@@ -445,7 +572,7 @@ void GuestMemory::write_bytes(uint32_t address,
     }
     validate_range(address, static_cast<uint32_t>(input.size()), pc,
                    MemoryAccess::write);
-    if (std::getenv("NWIIU_POOL_TRACE") != nullptr &&
+    if (env_nwiiu_pool_trace() &&
         ((address <= 0x39DE6FE0u &&
           0x39DE6FE0u - address < input.size()) ||
          (address <= 0x39DE7000u &&
@@ -453,7 +580,7 @@ void GuestMemory::write_bytes(uint32_t address,
         std::fprintf(stderr, "POOLBYTES pc=%08X address=%08X size=%zu\n",
                      pc, address, input.size());
     }
-    if (std::getenv("NWIIU_MATRIX_TRACE") != nullptr &&
+    if (env_nwiiu_matrix_trace() &&
         overlaps_matrix_trace(address, input.size())) {
         std::fprintf(stderr, "MATRIXBYTES pc=%08X address=%08X size=%zu\n",
                      pc, address, input.size());
@@ -486,13 +613,13 @@ void GuestMemory::fill(uint32_t address, uint32_t size,
         throw std::invalid_argument("guest memory fill pattern is empty");
     }
     validate_range(address, size, pc, MemoryAccess::write);
-    if (std::getenv("NWIIU_POOL_TRACE") != nullptr &&
+    if (env_nwiiu_pool_trace() &&
         ((address <= 0x39DE6FE0u && 0x39DE6FE0u - address < size) ||
          (address <= 0x39DE7000u && 0x39DE7000u - address < size))) {
         std::fprintf(stderr, "POOLFILL pc=%08X address=%08X size=%u\n",
                      pc, address, size);
     }
-    if (std::getenv("NWIIU_MATRIX_TRACE") != nullptr &&
+    if (env_nwiiu_matrix_trace() &&
         overlaps_matrix_trace(address, size)) {
         std::fprintf(stderr, "MATRIXFILL pc=%08X address=%08X size=%u\n",
                      pc, address, size);

@@ -22,6 +22,11 @@ public:
     void register_handler(std::string module, std::string symbol,
                           HleHandler handler);
     void register_imports(Executor& executor) const;
+    const HleHandler* find_handler(const std::string& module,
+                                   const std::string& symbol) const;
+    // Second-wave libraries and compatibility stubs (cafe_stubs.cpp). Runs
+    // after every other component has registered, and never overrides one.
+    void register_extra_handlers();
     void service_audio_frame();
     static constexpr size_t kAudioFrameSamples = 144 * 2;
     void capture_audio_frame(uint32_t data);
@@ -31,6 +36,11 @@ public:
     void set_vpad_buttons(uint32_t buttons) {
         vpad_connected_ = true;
         vpad_buttons_ = buttons;
+    }
+    // Sticks in [-1, 1], +y up, as VPADStatus reports them.
+    void set_vpad_sticks(float left_x, float left_y, float right_x,
+                         float right_y) {
+        vpad_sticks_ = {left_x, left_y, right_x, right_y};
     }
     Gx2Runtime& gx2() { return gx2_; }
     const Gx2Runtime& gx2() const { return gx2_; }
@@ -82,6 +92,7 @@ private:
     bool vpad_connected_{};
     uint32_t vpad_buttons_{};
     uint32_t vpad_last_buttons_{};
+    std::array<float, 4> vpad_sticks_{};
     CafeProcUi proc_ui_;
     CafePadscore padscore_;
     CafeAct act_;

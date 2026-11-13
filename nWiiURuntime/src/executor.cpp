@@ -1,16 +1,138 @@
 #include "runtime/executor.h"
+#include "runtime/host_sync.h"
 
 #include "nwiiu/analyzer/ppc_instruction.h"
 #include "runtime/ppc_semantics.h"
 
 #include <algorithm>
+#include <atomic>
+#include <chrono>
 #include <cstdio>
+#include <mutex>
+#include <thread>
+#include <map>
+#include <string>
+#include <vector>
 #include <cstdlib>
 #include <stdexcept>
 #include <utility>
 #include <unordered_map>
 
 namespace nwii::runtime {
+namespace {
+// Cached: getenv takes a lock and scans the environment on every call,
+// and these sit on per-access / per-dispatch paths.
+inline bool env_nwiiu_open_profile() {
+    static const bool enabled = std::getenv("NWIIU_OPEN_PROFILE") != nullptr;
+    return enabled;
+}
+inline bool env_nwiiu_open_trace() {
+    static const bool enabled = std::getenv("NWIIU_OPEN_TRACE") != nullptr;
+    return enabled;
+}
+inline bool env_nwiiu_hle_stats() {
+    static const bool enabled = std::getenv("NWIIU_HLE_STATS") != nullptr;
+    return enabled;
+}
+
+// NWIIU_SAMPLE_PROFILE=1: a host thread samples the guest PC the executor
+// last dispatched (block granularity) every 0.5 ms; the hottest PCs and
+// threads print at exit. Cheap enough to leave on for a whole run.
+std::atomic<uint32_t> g_sample_pc{0};
+std::atomic<uint32_t> g_sample_thread{0};
+
+// A copy: the image is destroyed before atexit handlers run.
+const std::map<uint32_t, ImportTarget>* g_sample_imports{};
+
+bool start_sample_profiler(const std::map<uint32_t, ImportTarget>& imports) {
+    if (std::getenv("NWIIU_SAMPLE_PROFILE") == nullptr) {
+        return false;
+    }
+    g_sample_imports = new std::map<uint32_t, ImportTarget>(imports);
+    static std::mutex mutex;
+    static std::unordered_map<uint32_t, uint64_t> pcs;
+    static std::unordered_map<uint32_t, uint64_t> threads;
+    static std::unordered_map<uint64_t, uint64_t> thread_pcs;
+    static std::atomic<bool> running{true};
+    std::thread([] {
+        // NWIIU_SAMPLE_DELAY=<seconds>: skip boot, profile only later scenes.
+        if (const char* delay = std::getenv("NWIIU_SAMPLE_DELAY")) {
+            std::this_thread::sleep_for(
+                std::chrono::seconds(std::strtoul(delay, nullptr, 10)));
+        }
+        while (running.load()) {
+            // Sub-millisecond sleeps return immediately on this toolchain,
+            // which turned the sampler into a busy loop on a host core.
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            const uint32_t pc = g_sample_pc.load(std::memory_order_relaxed);
+            const uint32_t thread =
+                g_sample_thread.load(std::memory_order_relaxed);
+            std::lock_guard lock(mutex);
+            ++pcs[pc];
+            ++threads[thread];
+            ++thread_pcs[(static_cast<uint64_t>(thread) << 32) | pc];
+        }
+    }).detach();
+    std::atexit([] {
+        running.store(false);
+        std::lock_guard lock(mutex);
+        const auto print = [](const char* title,
+                              const std::unordered_map<uint32_t, uint64_t>& map,
+                              size_t limit) {
+            std::vector<std::pair<uint64_t, uint32_t>> rows;
+            uint64_t total = 0;
+            for (const auto& [key, count] : map) {
+                rows.emplace_back(count, key);
+                total += count;
+            }
+            std::ranges::sort(rows, std::greater{});
+            std::fprintf(stderr, "%s (%llu samples)\n", title,
+                         static_cast<unsigned long long>(total));
+            for (size_t i = 0; i < std::min(limit, rows.size()); ++i) {
+                // Time inside an HLE handler is attributed to its import
+                // thunk, so name those.
+                std::string name;
+                if (g_sample_imports != nullptr) {
+                    if (const auto found = g_sample_imports->find(rows[i].second);
+                        found != g_sample_imports->end()) {
+                        name = found->second.module + ":" + found->second.symbol;
+                    }
+                }
+                std::fprintf(stderr, "  %08X %6.2f%% %s\n", rows[i].second,
+                             100.0 * static_cast<double>(rows[i].first) /
+                                 static_cast<double>(std::max<uint64_t>(1, total)),
+                             name.c_str());
+            }
+        };
+        print("SAMPLE THREADS", threads, 16);
+        print("SAMPLE PCS", pcs, 80);
+        std::vector<std::pair<uint64_t, uint64_t>> rows(thread_pcs.begin(),
+                                                        thread_pcs.end());
+        std::ranges::sort(rows, [](const auto& a, const auto& b) {
+            return a.second > b.second;
+        });
+        uint64_t total = 0;
+        for (const auto& row : rows) {
+            total += row.second;
+        }
+        std::fprintf(stderr, "SAMPLE THREAD PCS\n");
+        for (size_t i = 0; i < std::min<size_t>(80, rows.size()); ++i) {
+            const auto pc = static_cast<uint32_t>(rows[i].first);
+            std::string name;
+            if (const auto found = g_sample_imports->find(pc);
+                found != g_sample_imports->end()) {
+                name = found->second.module + ":" + found->second.symbol;
+            }
+            std::fprintf(stderr, "  %08X %08X %6.2f%% %s\n",
+                         static_cast<uint32_t>(rows[i].first >> 32), pc,
+                         100.0 * static_cast<double>(rows[i].second) /
+                             static_cast<double>(std::max<uint64_t>(1, total)),
+                         name.c_str());
+        }
+    });
+    return true;
+}
+} // namespace
 namespace {
 using nwiiu::analyzer::PpcInstruction;
 
@@ -169,6 +291,7 @@ void Executor::step(CPUContext& cpu) {
                 unsupported(pc, "reserved paired-single FRB field");
             }
             break;
+        case 18: // ps_div
         case 20: // ps_sub
         case 21: // ps_add
             if (instruction.frc() != 0) {
@@ -188,6 +311,21 @@ void Executor::step(CPUContext& cpu) {
             break;
         default:
             if (xo == 26 && instruction.ra() == 0) { // ps_rsqrte
+                break;
+            }
+            if (((raw >> 1) & 0x3F) == 6 || ((raw >> 1) & 0x3F) == 7 ||
+                ((raw >> 1) & 0x3F) == 38 || ((raw >> 1) & 0x3F) == 39) {
+                if (((raw >> 1) & 0x3F) >= 38 && instruction.ra() == 0) {
+                    unsupported(pc, "reserved paired-single update form");
+                }
+                break; // psq_lx / psq_stx / psq_lux / psq_stux
+            }
+            if ((xo == 72 || xo == 136 || xo == 264) &&
+                instruction.ra() == 0) { // ps_mr / ps_nabs / ps_abs
+                break;
+            }
+            if (instruction.xo5() == 24 && instruction.ra() == 0 &&
+                instruction.frc() == 0) { // ps_res
                 break;
             }
             if (xo == 32) { // ps_cmpo0
@@ -256,19 +394,21 @@ void Executor::step(CPUContext& cpu) {
             unsupported(pc, "reserved update load form");
         }
         break;
+    case 51:
+        if (instruction.ra() == 0) {
+            unsupported(pc, "reserved update load form");
+        }
+        break;
     case 57:
-        if (instruction.ra() == 0 || instruction.ps_i() != 0) {
+        if (instruction.ra() == 0) {
             unsupported(pc, "reserved paired-single update load form");
         }
         break;
     case 56:
     case 60:
-        if (instruction.ps_i() == 1 || instruction.ps_i() > 5) {
-            unsupported(pc, "unsupported paired-single GQR index");
-        }
         break;
     case 61:
-        if (instruction.ra() == 0 || instruction.ps_i() != 0) {
+        if (instruction.ra() == 0) {
             unsupported(pc, "reserved paired-single update store form");
         }
         break;
@@ -364,6 +504,18 @@ void Executor::step(CPUContext& cpu) {
         case 1003:
         case 922:
         case 954:
+        case 476: // nand
+        case 284: // eqv
+        case 234: // addme
+        case 746: // addmeo
+        case 232: // subfme
+        case 744: // subfmeo
+        case 598: // sync
+        case 854: // eieio
+        case 599: // lfdx
+        case 631: // lfdux
+        case 727: // stfdx
+        case 759: // stfdux
             break;
         case 150:
             if (!instruction.rc()) {
@@ -412,14 +564,17 @@ void Executor::step(CPUContext& cpu) {
         if (xo == 1014 && instruction.rt() != 0) {
             unsupported(pc, "reserved dcbz field");
         }
-        if (xo == 339 && instruction.spr() != 8 &&
-            instruction.spr() != 9) {
+        if ((xo == 339 || xo == 467) && instruction.spr() != 1 &&
+            instruction.spr() != 8 && instruction.spr() != 9 &&
+            !ppc::is_gqr_spr(instruction.spr())) {
             unsupported(pc, "unsupported SPR");
         }
-        if (xo == 467 && instruction.spr() != 8 &&
-            instruction.spr() != 9 &&
-            (instruction.spr() < 898 || instruction.spr() > 901)) {
-            unsupported(pc, "unsupported SPR");
+        if ((xo == 631 || xo == 759) && instruction.ra() == 0) {
+            unsupported(pc, "reserved update form");
+        }
+        if ((xo == 234 || xo == 746 || xo == 232 || xo == 744) &&
+            instruction.rb() != 0) {
+            unsupported(pc, "reserved zero-operand RB field");
         }
         if (xo == 597 &&
             !ppc::valid_lswi_form(instruction.rt(), instruction.ra(),
@@ -503,6 +658,39 @@ void Executor::step(CPUContext& cpu) {
 
     switch (opcode) {
     case 4:
+        if (((raw >> 1) & 0x3F) == 6 || ((raw >> 1) & 0x3F) == 38) {
+            (((raw >> 1) & 0x3F) == 6 ? ppc::psq_lx<GuestMemory> : ppc::psq_lux<GuestMemory>)(
+                cpu, image_.memory, instruction.rt(), instruction.ra(),
+                instruction.rb(), ((raw >> 10) & 1) != 0, (raw >> 7) & 7);
+            return;
+        }
+        if (((raw >> 1) & 0x3F) == 7 || ((raw >> 1) & 0x3F) == 39) {
+            (((raw >> 1) & 0x3F) == 7 ? ppc::psq_stx<GuestMemory> : ppc::psq_stux<GuestMemory>)(
+                cpu, image_.memory, instruction.rs(), instruction.ra(),
+                instruction.rb(), ((raw >> 10) & 1) != 0, (raw >> 7) & 7);
+            return;
+        }
+        if (xo == 72) {
+            ppc::ps_mr(cpu, instruction.rt(), instruction.rb());
+            return;
+        }
+        if (xo == 264) {
+            ppc::ps_abs(cpu, instruction.rt(), instruction.rb());
+            return;
+        }
+        if (xo == 136) {
+            ppc::ps_nabs(cpu, instruction.rt(), instruction.rb());
+            return;
+        }
+        if (instruction.xo5() == 24) {
+            ppc::ps_res(cpu, instruction.rt(), instruction.rb());
+            return;
+        }
+        if (instruction.xo5() == 18) {
+            ppc::ps_div(cpu, instruction.rt(), instruction.ra(),
+                        instruction.rb());
+            return;
+        }
         if (xo == 528) {
             ppc::ps_merge00(cpu, instruction.rt(), instruction.ra(),
                             instruction.rb());
@@ -907,6 +1095,46 @@ void Executor::step(CPUContext& cpu) {
             ppc::stfsx(cpu, image_.memory, instruction.rs(),
                        instruction.ra(), instruction.rb());
             return;
+        case 476:
+            ppc::nand_(cpu, instruction.ra(), instruction.rs(),
+                       instruction.rb(), instruction.rc());
+            return;
+        case 284:
+            ppc::eqv(cpu, instruction.ra(), instruction.rs(),
+                     instruction.rb(), instruction.rc());
+            return;
+        case 234:
+        case 746:
+            ppc::addme(cpu, instruction.rt(), instruction.ra(), xo == 746,
+                       instruction.rc());
+            return;
+        case 232:
+        case 744:
+            ppc::subfme(cpu, instruction.rt(), instruction.ra(), xo == 744,
+                        instruction.rc());
+            return;
+        case 598:
+            ppc::sync(cpu);
+            return;
+        case 854:
+            ppc::eieio(cpu);
+            return;
+        case 599:
+            ppc::lfdx(cpu, image_.memory, instruction.rt(), instruction.ra(),
+                      instruction.rb());
+            return;
+        case 631:
+            ppc::lfdux(cpu, image_.memory, instruction.rt(), instruction.ra(),
+                       instruction.rb());
+            return;
+        case 727:
+            ppc::stfdx(cpu, image_.memory, instruction.rs(), instruction.ra(),
+                       instruction.rb());
+            return;
+        case 759:
+            ppc::stfdux(cpu, image_.memory, instruction.rs(), instruction.ra(),
+                        instruction.rb());
+            return;
         }
         break;
     case 32:
@@ -984,6 +1212,10 @@ void Executor::step(CPUContext& cpu) {
     case 50:
         ppc::lfd(cpu, image_.memory, instruction.rt(), instruction.ra(),
                  instruction.simm());
+        return;
+    case 51:
+        ppc::lfdu(cpu, image_.memory, instruction.rt(), instruction.ra(),
+                  instruction.simm());
         return;
     case 52:
         ppc::stfs(cpu, image_.memory, instruction.rs(), instruction.ra(),
@@ -1121,7 +1353,7 @@ ExecutionSlice Executor::run_slice(
     uint32_t active_thread) {
     static std::unordered_map<uint32_t, uint64_t> opening_profile;
     const bool profile_opening =
-        std::getenv("NWIIU_OPEN_PROFILE") != nullptr;
+        env_nwiiu_open_profile();
     const auto terminal = [this, active_thread,
                            profile_opening](ExecutionStop stop) {
         snapshot_trace(stop, active_thread);
@@ -1140,7 +1372,12 @@ ExecutionSlice Executor::run_slice(
         }
         return ExecutionSlice{SliceCategory::terminal, std::move(stop)};
     };
+    static const bool sample_profile = start_sample_profiler(image_.imports);
     while (true) {
+        if (sample_profile) {
+            g_sample_pc.store(cpu.pc, std::memory_order_relaxed);
+            g_sample_thread.store(active_thread, std::memory_order_relaxed);
+        }
         if (!cpu.running) {
             return terminal(make_stop(StopCategory::guest_exit,
                                       "guest requested exit", cpu));
@@ -1149,7 +1386,7 @@ ExecutionSlice Executor::run_slice(
             return {SliceCategory::quantum, std::nullopt};
         }
         static std::unordered_map<uint32_t, uint64_t> logo_phase_calls;
-        if (std::getenv("NWIIU_OPEN_TRACE") != nullptr &&
+        if (env_nwiiu_open_trace() &&
             (cpu.pc == 0x025AC1D4 || cpu.pc == 0x025AC3B8 ||
              cpu.pc == 0x025AC494 || cpu.pc == 0x025AC5E0)) {
             const uint64_t calls = ++logo_phase_calls[cpu.pc];
@@ -1164,7 +1401,7 @@ ExecutionSlice Executor::run_slice(
             }
         }
         static uint64_t logo_phase_returns = 0;
-        if (std::getenv("NWIIU_OPEN_TRACE") != nullptr &&
+        if (env_nwiiu_open_trace() &&
             cpu.pc == 0x02019FAC) {
             const uint64_t calls = logo_phase_returns++;
             if (calls < 10 || calls % 4096 == 0) {
@@ -1211,6 +1448,28 @@ ExecutionSlice Executor::run_slice(
             cpu.native_executor = this;
             try {
                 native->thunk(cpu, image_.memory);
+                // Chain straight into the next registered block while it fits
+                // the budget. Blocks never touch HLE state, so the outer
+                // loop's import/exit/trace checks only matter when the next
+                // PC is not a block.
+                while (cpu.running && (cpu.pc & 3) == 0) {
+                    const auto& next_page = native_pages_[cpu.pc >> 16];
+                    if (next_page == nullptr) {
+                        break;
+                    }
+                    auto& next = (*next_page)[(cpu.pc & 0xFFFF) >> 2];
+                    if (next.instruction_count == 0 ||
+                        next.instruction_count >
+                            absolute_instruction_endpoint -
+                                cpu.instruction_count) {
+                        break;
+                    }
+                    if (sample_profile) {
+                        g_sample_pc.store(cpu.pc, std::memory_order_relaxed);
+                    }
+                    ++native_dispatch_count_;
+                    next.thunk(cpu, image_.memory);
+                }
             } catch (const GuestFault& fault) {
                 return terminal(with_faulting_word(
                     make_guest_fault_stop(fault, cpu)));
@@ -1234,6 +1493,79 @@ ExecutionSlice Executor::run_slice(
                 return terminal(std::move(stop));
             }
             cpu.current_instruction.reset();
+            // NWIIU_PARALLEL: imports and the scheduler state they touch are
+            // serialised; guest code between them runs unlocked.
+            host_sync::HleLock hle_lock;
+            if (env_nwiiu_hle_stats()) {
+                // NWIIU_HLE_STATS: per-import call counts, printed at exit.
+                static std::map<std::string, uint64_t>* counts = [] {
+                    auto* table = new std::map<std::string, uint64_t>();
+                    static auto* printed = table;
+                    std::atexit([] {
+                        std::vector<std::pair<uint64_t, std::string>> rows;
+                        for (const auto& [name, count] : *printed) {
+                            rows.emplace_back(count, name);
+                        }
+                        std::ranges::sort(rows, std::greater{});
+                        std::fprintf(stderr, "HLE STATS\n");
+                        for (const auto& [count, name] : rows) {
+                            std::fprintf(stderr, " %12llu %s\n",
+                                         static_cast<unsigned long long>(count),
+                                         name.c_str());
+                        }
+                    });
+                    return table;
+                }();
+                ++(*counts)[import->second.module + ":" +
+                            import->second.symbol];
+            }
+            // NWIIU_HLE_TAIL_THREAD=<hex OSThread>: ring of that thread's last
+            // 256 imports with lr/r3/r4, printed at exit. Locates what a
+            // thread did right before it bailed.
+            // A comma-separated list follows several threads.
+            using TailRings = std::map<uint32_t, std::vector<std::string>>;
+            static TailRings* tails = [] {
+                const char* value = std::getenv("NWIIU_HLE_TAIL_THREAD");
+                if (value == nullptr) {
+                    return static_cast<TailRings*>(nullptr);
+                }
+                auto* rings = new TailRings();
+                for (const char* p = value; *p != '\0';) {
+                    char* end = nullptr;
+                    const auto id =
+                        static_cast<uint32_t>(std::strtoul(p, &end, 16));
+                    if (end == p) {
+                        break;
+                    }
+                    (*rings)[id];
+                    p = *end == ',' ? end + 1 : end;
+                }
+                static auto* printed = rings;
+                std::atexit([] {
+                    for (const auto& [id, lines] : *printed) {
+                        std::fprintf(stderr, "HLE TAIL %08X\n", id);
+                        for (const auto& line : lines) {
+                            std::fprintf(stderr, "  %s\n", line.c_str());
+                        }
+                    }
+                });
+                return rings;
+            }();
+            if (tails != nullptr) {
+                if (auto ring = tails->find(active_thread);
+                    ring != tails->end()) {
+                    char line[200];
+                    std::snprintf(line, sizeof line,
+                                  "%s:%s lr=%08X r3=%08X r4=%08X",
+                                  import->second.module.c_str(),
+                                  import->second.symbol.c_str(), cpu.lr,
+                                  cpu.gpr[3], cpu.gpr[4]);
+                    ring->second.emplace_back(line);
+                    if (ring->second.size() > 256) {
+                        ring->second.erase(ring->second.begin());
+                    }
+                }
+            }
             const size_t trace_slot =
                 trace_enter(cpu.pc, active_thread, import->second);
             HleAction action;

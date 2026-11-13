@@ -4,6 +4,8 @@
 #include <algorithm>
 #include <bit>
 #include <cmath>
+#include <cstdio>
+#include <cstdlib>
 #include <stdexcept>
 #include <utility>
 
@@ -399,26 +401,49 @@ CafeRuntime::CafeRuntime(ExecutionImage& image)
                          ++offset) {
                         memory.write8(cpu.gpr[4] + offset, 0, cpu.pc);
                     }
-                    if (cpu.gpr[3] == 0 && vpad_connected_) {
-                        memory.write32(cpu.gpr[4], vpad_buttons_, cpu.pc);
+                    static const bool no_vpad =
+                        std::getenv("NWIIU_NO_VPAD") != nullptr;
+                    if (static bool logged = false;
+                        !logged && std::getenv("NWIIU_VPAD_TRACE")) {
+                        logged = true;
+                        std::fprintf(stderr, "VPADRead pc=%08X lr=%08X buf=%08X n=%u\n",
+                                     cpu.pc, cpu.lr, cpu.gpr[4], cpu.gpr[5]);
+                    }
+                    if (cpu.gpr[3] == 0 && vpad_connected_ && !no_vpad) {
+                        // Stick-emulation bits (L: 0x40000000 left ...
+                        // R: 0x00800000 down) let menus navigate by stick.
+                        uint32_t buttons = vpad_buttons_;
+                        constexpr float kEmulate = 0.5f;
+                        const auto& s = vpad_sticks_;
+                        if (s[0] < -kEmulate) buttons |= 0x40000000u;
+                        if (s[0] > kEmulate) buttons |= 0x20000000u;
+                        if (s[1] > kEmulate) buttons |= 0x10000000u;
+                        if (s[1] < -kEmulate) buttons |= 0x08000000u;
+                        if (s[2] < -kEmulate) buttons |= 0x04000000u;
+                        if (s[2] > kEmulate) buttons |= 0x02000000u;
+                        if (s[3] > kEmulate) buttons |= 0x01000000u;
+                        if (s[3] < -kEmulate) buttons |= 0x00800000u;
+                        memory.write32(cpu.gpr[4], buttons, cpu.pc);
                         memory.write32(cpu.gpr[4] + 4,
-                                       vpad_buttons_ & ~vpad_last_buttons_,
+                                       buttons & ~vpad_last_buttons_,
                                        cpu.pc);
                         memory.write32(cpu.gpr[4] + 8,
-                                       vpad_last_buttons_ & ~vpad_buttons_,
+                                       vpad_last_buttons_ & ~buttons,
                                        cpu.pc);
-                        memory.write32(cpu.gpr[4] + 0x10, vpad_buttons_, cpu.pc);
-                        memory.write32(cpu.gpr[4] + 0x14,
-                                       vpad_buttons_ & ~vpad_last_buttons_,
-                                       cpu.pc);
-                        memory.write32(cpu.gpr[4] + 0x18,
-                                       vpad_last_buttons_ & ~vpad_buttons_,
-                                       cpu.pc);
+                        // VPADStatus: leftStick at 0x0C, rightStick at 0x14
+                        // (two big-endian floats each). This used to write
+                        // the button masks here, which read as denormals.
+                        for (size_t axis = 0; axis < 4; ++axis) {
+                            memory.write32(cpu.gpr[4] + 0x0C +
+                                               static_cast<uint32_t>(axis) * 4,
+                                           std::bit_cast<uint32_t>(s[axis]),
+                                           cpu.pc);
+                        }
                         memory.write16(cpu.gpr[4] + 0x58, 3, cpu.pc);
                         memory.write16(cpu.gpr[4] + 0x60, 3, cpu.pc);
                         memory.write16(cpu.gpr[4] + 0x68, 3, cpu.pc);
                         memory.write8(cpu.gpr[4] + 0xA1, 4, cpu.pc);
-                        vpad_last_buttons_ = vpad_buttons_;
+                        vpad_last_buttons_ = buttons;
                         samples = 1;
                         error = 0;
                     } else {
@@ -745,6 +770,24 @@ void CafeRuntime::register_handler(std::string module, std::string symbol,
             return handler(cpu, memory);
         };
     }
+    if (module == "gx2" && std::getenv("NWIIU_GX2_STRICT") == nullptr) {
+        // GX2 faults are almost always "feature outside the WWHD subset",
+        // not guest bugs: report each distinct one and treat the call as a
+        // no-op so bring-up of other titles can continue.
+        handler = [symbol, handler = std::move(handler)](
+                      CPUContext& cpu, GuestMemory& memory) {
+            try {
+                return handler(cpu, memory);
+            } catch (const GuestFault& fault) {
+                static std::map<std::string, unsigned> seen;
+                if (seen[symbol + fault.what()]++ < 3) {
+                    std::fprintf(stderr, "GX2-SKIP %s: %s\n", symbol.c_str(),
+                                 fault.what());
+                }
+                return HleAction::return_to_lr;
+            }
+        };
+    }
     auto module_it = handlers_.try_emplace(std::move(module)).first;
     const auto [handler_it, inserted] =
         module_it->second.emplace(std::move(symbol), std::move(handler));
@@ -755,15 +798,38 @@ void CafeRuntime::register_handler(std::string module, std::string symbol,
     }
 }
 
+const HleHandler* CafeRuntime::find_handler(const std::string& module,
+                                            const std::string& symbol) const {
+    const auto found = handlers_.find(module);
+    if (found == handlers_.end()) {
+        return nullptr;
+    }
+    const auto handler = found->second.find(symbol);
+    return handler == found->second.end() ? nullptr : &handler->second;
+}
+
 void CafeRuntime::register_imports(Executor& executor) const {
+    // NWIIU_STUB_MISSING=1 turns every unimplemented function import into a
+    // logged `return 0`, to find the next *behavioural* blocker during
+    // bring-up. Off by default: a silent stub hides the real stop point.
+    const bool stub_missing = std::getenv("NWIIU_STUB_MISSING") != nullptr;
     for (const auto& [address, target] : image_.imports) {
-        const auto module = handlers_.find(target.module);
-        if (module == handlers_.end()) {
-            continue;
-        }
-        const auto handler = module->second.find(target.symbol);
-        if (handler != module->second.end()) {
-            executor.register_hle(address, handler->second);
+        if (const auto* handler = find_handler(target.module, target.symbol)) {
+            executor.register_hle(address, *handler);
+        } else if (stub_missing && !target.symbol.empty() &&
+                   target.symbol[0] != '.') {
+            const std::string name = target.module + "::" + target.symbol;
+            executor.register_hle(
+                address, [name, logged = false](CPUContext& cpu,
+                                                GuestMemory&) mutable {
+                    if (!logged) {
+                        std::fprintf(stderr, "STUB %s lr=%08X\n", name.c_str(),
+                                     cpu.lr);
+                        logged = true;
+                    }
+                    cpu.gpr[3] = 0;
+                    return HleAction::return_to_lr;
+                });
         }
     }
 }

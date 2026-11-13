@@ -1,4 +1,5 @@
 #pragma once
+#include <cstdlib>
 #include <array>
 #include "runtime/executor.h"
 #include <cstddef>
@@ -194,6 +195,15 @@ public:
     void attach_event_callback(void* context, Gx2EventCallback callback) {
         event_context_ = context;
         event_callback_ = callback;
+    }
+    // With a host renderer attached, colour clears and scan copies happen on
+    // the host GPU; mirroring them into guest memory cost ~15% of a UE3
+    // frame and nothing reads those bytes back. NWIIU_CPU_SURFACES=1 keeps
+    // the guest-memory copies.
+    bool host_owns_surfaces() const {
+        static const bool cpu_surfaces =
+            std::getenv("NWIIU_CPU_SURFACES") != nullptr;
+        return event_callback_ != nullptr && !cpu_surfaces;
     }
     uint32_t register_display_list_handler(std::string name,
                                            HleHandler handler);

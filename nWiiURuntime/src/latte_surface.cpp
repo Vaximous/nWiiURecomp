@@ -249,31 +249,43 @@ LatteSurfaceComputeError surface_error(LatteSurfaceComputeErrorCode code,
 // tile mode / swizzle. Only the authenticated reached feature subset is
 // implemented; anything else returns a structured unsupported result.
 LatteSurfaceComputeResult
-calculate_surface_size_and_alignment(const LatteSurfaceDescriptor& surface) {
-    if (surface.aa != 0) {
-        return surface_error(LatteSurfaceComputeErrorCode::unsupported_aa,
-                             surface);
+calculate_surface_size_and_alignment(const LatteSurfaceDescriptor& input) {
+    // Beyond the WWHD-verified subset the layout is approximated rather than
+    // refused: 2B/3D and multi-bank tilings are sized as 2D thin/thick, MSAA
+    // dims (6, 7) as their single-sample counterparts with the image scaled
+    // by the sample count, and unknown formats as 32 bpp.
+    LatteSurfaceDescriptor surface = input;
+    const uint32_t samples = 1u << std::min<uint32_t>(surface.aa, 3u);
+    surface.aa = 0;
+    if (surface.dim == 6) {
+        surface.dim = kDimTexture2D;
+    } else if (surface.dim == 7) {
+        surface.dim = kDimTexture2DArray;
+    }
+    switch (surface.tile_mode) {
+    case 11: case 13: case 15:
+        surface.tile_mode = kTile2DThick;
+        break;
+    case 5: case 6: case 8: case 9: case 10: case 12: case 14:
+        surface.tile_mode = kTile2DThin1;
+        break;
+    default:
+        break;
     }
     if (surface.dim != kDimTexture1D && surface.dim != kDimTexture2D &&
         surface.dim != kDimTexture3D && surface.dim != kDimTextureCube &&
         surface.dim != kDimTexture1DArray &&
         surface.dim != kDimTexture2DArray) {
         return surface_error(LatteSurfaceComputeErrorCode::unsupported_dim,
-                             surface);
+                             input);
     }
-    if (surface.tile_mode != kTileDefault &&
-        surface.tile_mode != kTile1DThin1 &&
-        surface.tile_mode != kTile2DThin1 &&
+    if (surface.tile_mode > kTile2DThick &&
         surface.tile_mode != kTileLinearSpecial) {
         return surface_error(LatteSurfaceComputeErrorCode::unsupported_tile_mode,
-                             surface);
+                             input);
     }
-    const auto bits = surface_element_bits(surface.format);
-    if (!bits) {
-        return surface_error(LatteSurfaceComputeErrorCode::unsupported_format,
-                             surface);
-    }
-    const uint32_t bpp = *bits;
+    const uint32_t bpp = surface_element_bits(surface.format).value_or(32u) *
+                         samples;
     const bool is_depth = (surface.use & kUseDepthBuffer) != 0;
     const bool is_color = (surface.use & kUseColorBuffer) != 0;
 
